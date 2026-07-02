@@ -24,6 +24,8 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional
 import tkinter as tk
 
+from operation_logger import OperationLogger, default_db_path
+
 JS_DEBUG_RULES_FILE = Path(__file__).with_name("js_debug_rules.json")
 
 
@@ -132,6 +134,7 @@ class JsCapturePanel:
         self.stop_event = threading.Event()
         self.cdp_lock = threading.Lock()
         self.cdp_id = 0
+        self.rule_store = self._create_rule_store()
         self.override_rules: List[Dict[str, str]] = self._load_rules()
         self.log_rows: Dict[str, Dict[str, Any]] = {}
         self.navigate_url = ""
@@ -140,6 +143,16 @@ class JsCapturePanel:
         self.file_mtimes: Dict[str, float] = {}
         self.env_options = self._load_env_options()
         self._build()
+
+    def _config_path(self) -> str:
+        if hasattr(self.gui, "_get_config_path"):
+            return str(self.gui._get_config_path())
+        return str(Path(__file__).with_name("config.json"))
+
+    def _create_rule_store(self) -> OperationLogger:
+        if hasattr(self.gui, "op_logger"):
+            return self.gui.op_logger
+        return OperationLogger(default_db_path(self._config_path()))
 
     def _load_env_options(self) -> List[Dict[str, str]]:
         config_path = ""
@@ -177,6 +190,22 @@ class JsCapturePanel:
 
     def _load_rules(self) -> List[Dict[str, str]]:
         try:
+            rows = self.rule_store.list_js_debug_rules()
+            if rows:
+                return [
+                    {
+                        "match": str(row.get("match_text", "")),
+                        "file": str(row.get("local_file", "")),
+                        "mime": str(row.get("mime", "")),
+                    }
+                    for row in rows
+                ]
+            if self.rule_store.get_meta("js_debug_rules_json_imported") == "1":
+                return []
+        except Exception:
+            pass
+
+        try:
             if not JS_DEBUG_RULES_FILE.exists():
                 return []
             raw = json.loads(JS_DEBUG_RULES_FILE.read_text(encoding="utf-8"))
@@ -190,13 +219,19 @@ class JsCapturePanel:
                 local_file = str(item.get("file", "")).strip()
                 if match and local_file:
                     rules.append({"match": match, "file": local_file, "mime": str(item.get("mime") or self._guess_mime(Path(local_file)))})
+            try:
+                self.rule_store.replace_js_debug_rules(rules)
+                self.rule_store.set_meta("js_debug_rules_json_imported", "1")
+            except Exception:
+                pass
             return rules
         except Exception:
             return []
 
     def _save_rules(self) -> None:
         try:
-            JS_DEBUG_RULES_FILE.write_text(json.dumps(self.override_rules, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.rule_store.replace_js_debug_rules(self.override_rules)
+            self.rule_store.set_meta("js_debug_rules_json_imported", "1")
         except Exception as exc:
             self.status_var.set(f"保存替换规则失败: {exc}")
 

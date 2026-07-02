@@ -153,6 +153,21 @@ class OperationLogger:
                         ON translation_cache(updated_at DESC);
                     CREATE INDEX IF NOT EXISTS idx_translation_cache_source_lang
                         ON translation_cache(source_text, lang_name);
+
+                    CREATE TABLE IF NOT EXISTS js_debug_rules (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        match_text TEXT NOT NULL,
+                        local_file TEXT NOT NULL,
+                        mime TEXT NOT NULL,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        sort_order INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(match_text, local_file)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_js_debug_rules_sort
+                        ON js_debug_rules(enabled DESC, sort_order ASC, id ASC);
                     """
                 )
                 row = conn.execute(
@@ -163,6 +178,27 @@ class OperationLogger:
                         "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
                         (str(SCHEMA_VERSION),),
                     )
+                conn.commit()
+
+    def get_meta(self, key: str, default: str = "") -> str:
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT value FROM schema_meta WHERE key = ?",
+                    (key,),
+                ).fetchone()
+        return str(row["value"]) if row else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO schema_meta(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, value),
+                )
                 conn.commit()
 
     def start_session(
@@ -427,6 +463,46 @@ class OperationLogger:
                     """,
                     (source, lang, str(lang_label).strip(), translated, now, now),
                 )
+                conn.commit()
+
+    def list_js_debug_rules(self, *, include_disabled: bool = False) -> List[Dict[str, Any]]:
+        where_sql = "" if include_disabled else "WHERE enabled = 1"
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT id, match_text, local_file, mime, enabled, sort_order, created_at, updated_at
+                    FROM js_debug_rules
+                    {where_sql}
+                    ORDER BY sort_order ASC, id ASC
+                    """
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def replace_js_debug_rules(self, rules: List[Dict[str, str]]) -> None:
+        now = _utc_now_iso()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM js_debug_rules")
+                for index, rule in enumerate(rules):
+                    match = str(rule.get("match") or rule.get("match_text") or "").strip()
+                    local_file = str(rule.get("file") or rule.get("local_file") or "").strip()
+                    mime = str(rule.get("mime") or "").strip()
+                    if not match or not local_file:
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO js_debug_rules (
+                            match_text, local_file, mime, enabled, sort_order, created_at, updated_at
+                        ) VALUES (?, ?, ?, 1, ?, ?, ?)
+                        ON CONFLICT(match_text, local_file) DO UPDATE SET
+                            mime = excluded.mime,
+                            enabled = 1,
+                            sort_order = excluded.sort_order,
+                            updated_at = excluded.updated_at
+                        """,
+                        (match, local_file, mime, index, now, now),
+                    )
                 conn.commit()
 
     def _translation_cache_filter_sql(
