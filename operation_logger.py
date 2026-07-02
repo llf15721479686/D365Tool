@@ -168,6 +168,52 @@ class OperationLogger:
 
                     CREATE INDEX IF NOT EXISTS idx_js_debug_rules_sort
                         ON js_debug_rules(enabled DESC, sort_order ASC, id ASC);
+
+                    CREATE TABLE IF NOT EXISTS local_crm_tables (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        environment_name TEXT NOT NULL,
+                        org_url TEXT NOT NULL,
+                        logical_name TEXT NOT NULL,
+                        schema_name TEXT,
+                        display_name_zh TEXT,
+                        display_name_en TEXT,
+                        object_type_code INTEGER,
+                        is_custom_entity INTEGER NOT NULL DEFAULT 0,
+                        primary_id_attribute TEXT,
+                        primary_name_attribute TEXT,
+                        field_count INTEGER NOT NULL DEFAULT 0,
+                        last_refreshed_at TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(org_url, logical_name)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_local_crm_tables_updated_at
+                        ON local_crm_tables(updated_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_local_crm_tables_env_name
+                        ON local_crm_tables(environment_name, logical_name);
+
+                    CREATE TABLE IF NOT EXISTS local_crm_table_fields (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        table_id INTEGER NOT NULL,
+                        logical_name TEXT NOT NULL,
+                        schema_name TEXT,
+                        display_name_zh TEXT,
+                        display_name_en TEXT,
+                        attribute_type TEXT,
+                        required_level TEXT,
+                        is_custom INTEGER NOT NULL DEFAULT 0,
+                        valid_for_create INTEGER NOT NULL DEFAULT 0,
+                        valid_for_update INTEGER NOT NULL DEFAULT 0,
+                        valid_for_read INTEGER NOT NULL DEFAULT 0,
+                        sort_order INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(table_id, logical_name),
+                        FOREIGN KEY (table_id) REFERENCES local_crm_tables(id) ON DELETE CASCADE
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_local_crm_table_fields_table
+                        ON local_crm_table_fields(table_id, sort_order ASC, id ASC);
                     """
                 )
                 row = conn.execute(
@@ -504,6 +550,136 @@ class OperationLogger:
                         (match, local_file, mime, index, now, now),
                     )
                 conn.commit()
+
+    def upsert_local_crm_table(
+        self,
+        *,
+        environment_name: str,
+        org_url: str,
+        entity_info: Dict[str, Any],
+        fields: List[Dict[str, Any]],
+    ) -> int:
+        now = _utc_now_iso()
+        logical_name = str(entity_info.get("logical_name", "")).strip()
+        clean_org_url = str(org_url).strip().rstrip("/")
+        if not logical_name or not clean_org_url:
+            raise ValueError("local table requires org_url and logical_name")
+
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO local_crm_tables (
+                        environment_name, org_url, logical_name, schema_name,
+                        display_name_zh, display_name_en, object_type_code, is_custom_entity,
+                        primary_id_attribute, primary_name_attribute, field_count,
+                        last_refreshed_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(org_url, logical_name) DO UPDATE SET
+                        environment_name = excluded.environment_name,
+                        schema_name = excluded.schema_name,
+                        display_name_zh = excluded.display_name_zh,
+                        display_name_en = excluded.display_name_en,
+                        object_type_code = excluded.object_type_code,
+                        is_custom_entity = excluded.is_custom_entity,
+                        primary_id_attribute = excluded.primary_id_attribute,
+                        primary_name_attribute = excluded.primary_name_attribute,
+                        field_count = excluded.field_count,
+                        last_refreshed_at = excluded.last_refreshed_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(environment_name).strip(),
+                        clean_org_url,
+                        logical_name,
+                        str(entity_info.get("schema_name", "") or ""),
+                        str(entity_info.get("display_name_zh", "") or ""),
+                        str(entity_info.get("display_name_en", "") or ""),
+                        entity_info.get("object_type_code"),
+                        1 if entity_info.get("is_custom_entity") else 0,
+                        str(entity_info.get("primary_id_attribute", "") or ""),
+                        str(entity_info.get("primary_name_attribute", "") or ""),
+                        len(fields),
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                table_id = int(
+                    conn.execute(
+                        "SELECT id FROM local_crm_tables WHERE org_url = ? AND logical_name = ?",
+                        (clean_org_url, logical_name),
+                    ).fetchone()["id"]
+                )
+                conn.execute("DELETE FROM local_crm_table_fields WHERE table_id = ?", (table_id,))
+                for index, field in enumerate(fields):
+                    field_name = str(field.get("logical_name", "") or "").strip()
+                    if not field_name:
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO local_crm_table_fields (
+                            table_id, logical_name, schema_name, display_name_zh, display_name_en,
+                            attribute_type, required_level, is_custom, valid_for_create,
+                            valid_for_update, valid_for_read, sort_order, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            table_id,
+                            field_name,
+                            str(field.get("schema_name", "") or ""),
+                            str(field.get("display_name_zh", "") or ""),
+                            str(field.get("display_name_en", "") or ""),
+                            str(field.get("attribute_type", "") or ""),
+                            str(field.get("required_level", "") or ""),
+                            1 if field.get("is_custom") else 0,
+                            1 if field.get("valid_for_create") else 0,
+                            1 if field.get("valid_for_update") else 0,
+                            1 if field.get("valid_for_read") else 0,
+                            index,
+                            now,
+                        ),
+                    )
+                conn.commit()
+                return table_id
+
+    def list_local_crm_tables(self, keyword: str = "") -> List[Dict[str, Any]]:
+        params: List[Any] = []
+        where_sql = ""
+        clean_keyword = str(keyword or "").strip()
+        if clean_keyword:
+            like = f"%{clean_keyword}%"
+            where_sql = """
+            WHERE logical_name LIKE ? OR schema_name LIKE ? OR display_name_zh LIKE ?
+                OR display_name_en LIKE ? OR environment_name LIKE ?
+            """
+            params.extend([like, like, like, like, like])
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM local_crm_tables
+                    {where_sql}
+                    ORDER BY updated_at DESC, logical_name ASC
+                    """,
+                    params,
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_local_crm_table_fields(self, table_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM local_crm_table_fields
+                    WHERE table_id = ?
+                    ORDER BY sort_order ASC, id ASC
+                    """,
+                    (int(table_id),),
+                ).fetchall()
+        return [dict(row) for row in rows]
 
     def _translation_cache_filter_sql(
         self,

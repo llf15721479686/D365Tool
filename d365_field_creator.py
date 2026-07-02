@@ -141,6 +141,7 @@ PANEL_LABELS: Dict[str, str] = {
     "connection": "连接配置",
     "field": "字段创建",
     "field_changes": "字段变更记录",
+    "local_table_store": "本地表存储",
     "translation": "实体翻译",
     "translation_records": "翻译记录列表",
     "table_query": "数据表查询",
@@ -160,6 +161,7 @@ LOG_CATEGORY_LABELS: Dict[str, str] = {
     "connection": "连接配置",
     "field": "字段创建",
     "field_changes": "字段变更记录",
+    "local_table_store": "本地表存储",
     "translation": "实体翻译",
     "table_query": "数据表查询",
     "access_inspector": "用户角色追溯",
@@ -2286,6 +2288,8 @@ class FieldCreatorGUI:
         if previous_panel == "publish_history" and panel_id != "publish_history":
             if hasattr(self, "publish_history_panel"):
                 self.publish_history_panel.on_hide()
+        if previous_panel == "local_table_store" and panel_id != "local_table_store":
+            self._cancel_local_table_auto_refresh()
         frame.tkraise()
         self._active_panel = panel_id
         if panel_id == "deploy":
@@ -2294,6 +2298,10 @@ class FieldCreatorGUI:
             self._refresh_logs_panel()
         elif panel_id == "translation_records":
             self._refresh_translation_records_panel()
+        elif panel_id == "local_table_store":
+            self._refresh_local_table_store_panel()
+            if hasattr(self, "local_table_auto_refresh_var") and self.local_table_auto_refresh_var.get():
+                self._schedule_local_table_auto_refresh()
         elif panel_id == "plugin" and hasattr(self, "plugin_panel"):
             self.plugin_panel.refresh()
         elif panel_id == "publish_history" and hasattr(self, "publish_history_panel"):
@@ -2348,6 +2356,7 @@ class FieldCreatorGUI:
             ("connection", "连接配置", self._build_connection_panel),
             ("field", "字段创建", self._build_field_panel),
             ("field_changes", "字段变更记录", self._build_field_changes_panel),
+            ("local_table_store", "本地表存储", self._build_local_table_store_panel),
             ("translation", "实体翻译", self._build_translation_panel),
             ("translation_records", "实体翻译记录", self._build_translation_records_panel),
             ("table_query", "数据表查询", self._build_table_query_panel),
@@ -2365,6 +2374,7 @@ class FieldCreatorGUI:
             ("field_group", "字段管理", "", None),
             ("field", "字段创建", "field_group", "field"),
             ("table_query", "数据表查询", "field_group", "table_query"),
+            ("local_table_store", "本地表存储", "field_group", "local_table_store"),
             ("translation_group", "翻译管理", "", None),
             ("translation", "实体翻译", "translation_group", "translation"),
             ("translation_records", "实体翻译记录", "translation_group", "translation_records"),
@@ -3371,6 +3381,231 @@ namespace D365ModelTemplate
             raise RuntimeError(f"未找到环境配置: {env_name}")
         return env
 
+    def _build_local_table_store_panel(self, parent: ttk.Frame) -> None:
+        parent.rowconfigure(2, weight=1)
+        parent.rowconfigure(4, weight=2)
+        parent.columnconfigure(0, weight=1)
+
+        toolbar = ttk.Frame(parent, padding=(8, 8, 8, 4))
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.columnconfigure(2, weight=1)
+
+        ttk.Label(toolbar, text="本地表存储", font=("", 11, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Button(toolbar, text="刷新本地列表", command=self._refresh_local_table_store_panel).grid(row=0, column=1, padx=(0, 8))
+
+        self.local_table_keyword_var = tk.StringVar()
+        keyword_entry = ttk.Entry(toolbar, textvariable=self.local_table_keyword_var)
+        keyword_entry.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+        keyword_entry.bind("<Return>", lambda _e: self._refresh_local_table_store_panel())
+        ttk.Button(toolbar, text="筛选", command=self._refresh_local_table_store_panel).grid(row=0, column=3, padx=(0, 8))
+
+        ttk.Button(toolbar, text="立即更新全部", command=self._refresh_all_local_tables_from_crm).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(toolbar, text="更新选中表", command=self._refresh_selected_local_table_from_crm).grid(row=0, column=5, padx=(0, 8))
+
+        self.local_table_auto_refresh_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            toolbar,
+            text="自动刷新(30秒)",
+            variable=self.local_table_auto_refresh_var,
+            command=self._on_local_table_auto_refresh_toggle,
+        ).grid(row=0, column=6, sticky="w")
+
+        self.local_table_status_var = tk.StringVar(value="数据表查询成功后会自动保存到这里。")
+        ttk.Label(parent, textvariable=self.local_table_status_var, foreground="#666").grid(
+            row=1, column=0, sticky="w", padx=8, pady=(0, 4)
+        )
+
+        table_frame = ttk.LabelFrame(parent, text="本地已保存表", padding=4)
+        table_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 6))
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        self.local_table_tree = ttk.Treeview(
+            table_frame,
+            columns=("environment_name", "logical_name", "display_name", "schema_name", "field_count", "last_refreshed_at"),
+            show="headings",
+            selectmode="browse",
+            height=8,
+        )
+        for column, title, width in (
+            ("environment_name", "环境", 120),
+            ("logical_name", "逻辑名", 180),
+            ("display_name", "显示名", 240),
+            ("schema_name", "Schema名", 180),
+            ("field_count", "字段数", 70),
+            ("last_refreshed_at", "最后刷新", 190),
+        ):
+            self.local_table_tree.heading(column, text=title)
+            self.local_table_tree.column(column, width=width, anchor="w", stretch=(column in {"display_name", "schema_name"}))
+        self.local_table_tree.grid(row=0, column=0, sticky="nsew")
+        table_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.local_table_tree.yview)
+        table_y.grid(row=0, column=1, sticky="ns")
+        self.local_table_tree.configure(yscrollcommand=table_y.set)
+        self.local_table_tree.bind("<<TreeviewSelect>>", self._on_local_table_selected)
+
+        self.local_table_info_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self.local_table_info_var, foreground="#333").grid(
+            row=3, column=0, sticky="w", padx=8, pady=(0, 4)
+        )
+
+        field_frame = ttk.LabelFrame(parent, text="本地字段缓存", padding=4)
+        field_frame.grid(row=4, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        field_frame.rowconfigure(0, weight=1)
+        field_frame.columnconfigure(0, weight=1)
+        self.local_table_field_tree = self._create_table_query_field_tree(field_frame)
+
+        self.local_table_rows: List[Dict[str, Any]] = []
+        self.local_table_row_map: Dict[str, Dict[str, Any]] = {}
+        self.local_table_refreshing = False
+        self.local_table_auto_refresh_job: Optional[str] = None
+        self._refresh_local_table_store_panel()
+
+    def _refresh_local_table_store_panel(self) -> None:
+        if not hasattr(self, "local_table_tree") or not hasattr(self, "op_logger"):
+            return
+        keyword = self.local_table_keyword_var.get().strip() if hasattr(self, "local_table_keyword_var") else ""
+        rows = self.op_logger.list_local_crm_tables(keyword)
+        self.local_table_rows = rows
+        self.local_table_row_map = {}
+        for item in self.local_table_tree.get_children():
+            self.local_table_tree.delete(item)
+        for row in rows:
+            item_id = str(row.get("id"))
+            display = _join_display_names(str(row.get("display_name_zh") or ""), str(row.get("display_name_en") or ""))
+            self.local_table_tree.insert(
+                "",
+                "end",
+                iid=item_id,
+                values=(
+                    row.get("environment_name", ""),
+                    row.get("logical_name", ""),
+                    display,
+                    row.get("schema_name", ""),
+                    row.get("field_count", 0),
+                    row.get("last_refreshed_at", ""),
+                ),
+            )
+            self.local_table_row_map[item_id] = row
+        self.local_table_status_var.set(f"本地共 {len(rows)} 张表。")
+        self._populate_table_query_tree(self.local_table_field_tree, [])
+        self.local_table_info_var.set("")
+
+    def _on_local_table_selected(self, _event: Any = None) -> None:
+        selection = self.local_table_tree.selection()
+        if not selection:
+            return
+        row = self.local_table_row_map.get(selection[0])
+        if not row:
+            return
+        fields = self.op_logger.list_local_crm_table_fields(int(row["id"]))
+        self._populate_table_query_tree(self.local_table_field_tree, fields)
+        display = _join_display_names(str(row.get("display_name_zh") or ""), str(row.get("display_name_en") or "")) or "-"
+        self.local_table_info_var.set(
+            f"环境: {row.get('environment_name', '')} | 表: {row.get('logical_name', '')} | 显示名: {display} | 字段数: {len(fields)}"
+        )
+
+    def _local_table_env_map(self) -> Dict[str, Dict[str, str]]:
+        envs = load_environments(self._get_config_path())
+        env_map: Dict[str, Dict[str, str]] = {}
+        for env in envs:
+            env_map[str(env.get("name", "")).strip().lower()] = env
+            env_map[str(env.get("org_url", "")).strip().rstrip("/").lower()] = env
+        return env_map
+
+    def _resolve_local_table_environment(self, row: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        env_map = self._local_table_env_map()
+        env = env_map.get(str(row.get("environment_name", "")).strip().lower())
+        if env:
+            return env
+        return env_map.get(str(row.get("org_url", "")).strip().rstrip("/").lower())
+
+    def _refresh_selected_local_table_from_crm(self) -> None:
+        selection = self.local_table_tree.selection() if hasattr(self, "local_table_tree") else ()
+        if not selection:
+            messagebox.showwarning("提示", "请先选择一张本地表。", parent=self.root)
+            return
+        row = self.local_table_row_map.get(selection[0])
+        if row:
+            self._refresh_local_tables_from_crm([row])
+
+    def _refresh_all_local_tables_from_crm(self) -> None:
+        rows = list(getattr(self, "local_table_rows", []))
+        if not rows:
+            self.local_table_status_var.set("本地还没有保存表，请先在数据表查询中查询一次。")
+            return
+        self._refresh_local_tables_from_crm(rows)
+
+    def _refresh_local_tables_from_crm(self, rows: List[Dict[str, Any]]) -> None:
+        if getattr(self, "local_table_refreshing", False):
+            return
+        self.local_table_refreshing = True
+        self.local_table_status_var.set(f"正在从 CRM 更新 {len(rows)} 张本地表...")
+
+        def worker() -> None:
+            updated = 0
+            failed: List[str] = []
+            for row in rows:
+                logical_name = str(row.get("logical_name", "")).strip()
+                try:
+                    env = self._resolve_local_table_environment(row)
+                    if not env:
+                        failed.append(f"{logical_name}: 未找到环境配置")
+                        continue
+                    creator = self._create_creator_for_environment(env)
+                    entity_info = creator.get_entity_info(logical_name)
+                    attributes = creator.list_entity_attributes(logical_name)
+                    self.op_logger.upsert_local_crm_table(
+                        environment_name=str(env.get("name", row.get("environment_name", ""))),
+                        org_url=str(env.get("org_url", row.get("org_url", ""))),
+                        entity_info=entity_info,
+                        fields=attributes,
+                    )
+                    updated += 1
+                except Exception as exc:
+                    failed.append(f"{logical_name}: {_format_exception(exc)}")
+
+            def on_done() -> None:
+                self.local_table_refreshing = False
+                self._refresh_local_table_store_panel()
+                msg = f"CRM 更新完成：成功 {updated} 张，失败 {len(failed)} 张。"
+                if failed:
+                    msg += " " + "；".join(failed[:3])
+                self.local_table_status_var.set(msg)
+                self._append_log(msg)
+
+            self.root.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_local_table_auto_refresh_toggle(self) -> None:
+        if self.local_table_auto_refresh_var.get():
+            self._schedule_local_table_auto_refresh()
+        else:
+            self._cancel_local_table_auto_refresh()
+
+    def _schedule_local_table_auto_refresh(self) -> None:
+        self._cancel_local_table_auto_refresh()
+        if not hasattr(self, "local_table_auto_refresh_var") or not self.local_table_auto_refresh_var.get():
+            return
+        if self._active_panel != "local_table_store":
+            return
+        self.local_table_auto_refresh_job = self.root.after(30000, self._local_table_auto_refresh_tick)
+
+    def _cancel_local_table_auto_refresh(self) -> None:
+        job = getattr(self, "local_table_auto_refresh_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except ValueError:
+                pass
+        self.local_table_auto_refresh_job = None
+
+    def _local_table_auto_refresh_tick(self) -> None:
+        self.local_table_auto_refresh_job = None
+        if self._active_panel == "local_table_store" and self.local_table_auto_refresh_var.get():
+            self._refresh_all_local_tables_from_crm()
+            self._schedule_local_table_auto_refresh()
+
     def _build_translation_panel(self, parent: ttk.Frame) -> None:
         """构建实体翻译面板。"""
         parent.rowconfigure(0, weight=1)
@@ -3666,6 +3901,12 @@ namespace D365ModelTemplate
 
                 def on_done() -> None:
                     self._table_query_loading = False
+                    self.op_logger.upsert_local_crm_table(
+                        environment_name=env_name,
+                        org_url=env_url,
+                        entity_info=entity_info,
+                        fields=attributes,
+                    )
                     self._table_query_rows = attributes
                     self.table_query_filter_var.set("")
                     if hasattr(self, "table_query_pager"):
