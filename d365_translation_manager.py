@@ -92,9 +92,11 @@ def translate_baidu(
     target_lang: str,
     app_id: str,
     secret_key: str,
-    api_url: str = "https://fanyi-api.baidu.com/api/trans/vip/translate",
+    api_url: str = "",
 ) -> str:
     """调用百度翻译 API 进行翻译。"""
+    if not app_id or not secret_key or not api_url:
+        raise RuntimeError("百度翻译 API 未配置，请在 config.json 中设置 baidu_app_id、baidu_secret_key、baidu_api_url。")
     salt = str(random.randint(32768, 65536))
     sign = _get_sign_baidu(app_id, text, salt, secret_key)
     params = {
@@ -128,9 +130,11 @@ def translate_youdao(
     target_lang: str,
     app_key: str,
     app_secret: str,
-    api_url: str = "https://openapi.youdao.com/api",
+    api_url: str = "",
 ) -> str:
     """调用有道智云翻译 API 进行翻译。"""
+    if not app_key or not app_secret or not api_url:
+        raise RuntimeError("有道翻译 API 未配置，请在 config.json 中设置 youdao_app_key、youdao_app_secret、youdao_api_url。")
     salt = str(random.randint(32768, 65536))
     curtime = str(int(time.time()))
     sign = _get_sign_youdao(app_key, text, salt, curtime, app_secret)
@@ -209,10 +213,10 @@ class D365TranslationManager:
         self,
         baidu_app_id: str = "",
         baidu_secret_key: str = "",
-        baidu_api_url: str = "https://fanyi-api.baidu.com/api/trans/vip/translate",
+        baidu_api_url: str = "",
         youdao_app_key: str = "",
         youdao_app_secret: str = "",
-        youdao_api_url: str = "https://openapi.youdao.com/api",
+        youdao_api_url: str = "",
     ) -> None:
         self.baidu_app_id = baidu_app_id
         self.baidu_secret_key = baidu_secret_key
@@ -284,14 +288,10 @@ class D365TranslationManager:
 
         cfg = load_config(config_path)
         return {
-            "baidu_app_id": str(cfg.get("BaiduAppId", "20250711002403394")),
-            "baidu_secret_key": str(cfg.get("BaiduSecretKey", "_qnpHJqG3nsng76K8jlg")),
-            "baidu_api_url": str(
-                cfg.get("BaiduApiUrl", "https://fanyi-api.baidu.com/api/trans/vip/translate")
-            ),
-            "youdao_app_key": str(cfg.get("YoudaoAppKey", "00557bf448f5eef1")),
-            "youdao_app_secret": str(cfg.get("YoudaoAppSecret", "YtduGCxHdSLbbmh2JbxJk90uqSfbIMlV")),
-            "youdao_api_url": str(
-                cfg.get("YoudaoApiUrl", "https://openapi.youdao.com/api")
-            ),
+            "baidu_app_id": str(cfg.get("baidu_app_id") or cfg.get("BaiduAppId") or "").strip(),
+            "baidu_secret_key": str(cfg.get("baidu_secret_key") or cfg.get("BaiduSecretKey") or "").strip(),
+            "baidu_api_url": str(cfg.get("baidu_api_url") or cfg.get("BaiduApiUrl") or "").strip(),
+            "youdao_app_key": str(cfg.get("youdao_app_key") or cfg.get("YoudaoAppKey") or "").strip(),
+            "youdao_app_secret": str(cfg.get("youdao_app_secret") or cfg.get("YoudaoAppSecret") or "").strip(),
+            "youdao_api_url": str(cfg.get("youdao_api_url") or cfg.get("YoudaoApiUrl") or "").strip(),
         }

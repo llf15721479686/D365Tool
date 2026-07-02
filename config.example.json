@@ -8,6 +8,12 @@
   "solution_unique_name": "",
   "publisher_prefix": "mcs",
   "activation_secret": "change-this-to-your-own-activation-secret",
+  "baidu_app_id": "your-baidu-app-id",
+  "baidu_secret_key": "your-baidu-secret-key",
+  "baidu_api_url": "https://fanyi-api.baidu.com/api/trans/vip/translate",
+  "youdao_app_key": "your-youdao-app-key",
+  "youdao_app_secret": "your-youdao-app-secret",
+  "youdao_api_url": "https://openapi.youdao.com/api",
   "environments": [
     {
       "name": "UAT",
