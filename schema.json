@@ -1,0 +1,21 @@
+{
+  "entity_logical_name": "account",
+  "solution_unique_name": "YourSolutionUniqueName",
+  "publisher_prefix": "new",
+  "fields": [
+    {
+      "logical_name": "new_testfield01",
+      "schema_name": "new_TestField01",
+      "display_name": "Test Field 01",
+      "description": "Created by d365_field_creator",
+      "field_type": "string",
+      "required_level": "None",
+      "is_audit_enabled": false,
+      "searchable": true,
+      "string": {
+        "max_length": 100,
+        "format": "Text"
+      }
+    }
+  ]
+}

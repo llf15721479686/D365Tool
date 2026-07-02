@@ -1,0 +1,16 @@
+config.json
+*.db
+*.db-shm
+*.db-wal
+js_debug_rules.json
+
+.venv/
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+release/
+*.spec
+
+.idea/

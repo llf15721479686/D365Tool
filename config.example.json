@@ -1,0 +1,22 @@
+{
+  "tenant_id": "your-tenant-id",
+  "client_id": "your-app-client-id",
+  "client_secret": "your-client-secret-value",
+  "org_url": "https://your-org.crm.dynamics.com",
+  "schema_file": "schema.json",
+  "entity_logical_name": "",
+  "solution_unique_name": "",
+  "publisher_prefix": "mcs",
+  "activation_secret": "change-this-to-your-own-activation-secret",
+  "environments": [
+    {
+      "name": "UAT",
+      "org_url": "https://your-uat-org.crm.dynamics.com",
+      "client_id": "your-uat-app-client-id",
+      "client_secret": "your-uat-client-secret-value"
+    }
+  ],
+  "openai_api_key": "",
+  "openai_model": "gpt-5.4-mini",
+  "openai_api_url": "https://api.openai.com/v1/responses"
+}
