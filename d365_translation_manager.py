@@ -31,12 +31,22 @@ LANGUAGE_LCID: Dict[str, str] = {
 }
 
 
+def normalize_language_name(lang_name: str) -> str:
+    """Return the display language name without a D365 LCID suffix."""
+    text = str(lang_name or "").strip()
+    for marker in ("[", "【"):
+        if marker in text:
+            text = text.split(marker, 1)[0].strip()
+    return text
+
+
 def get_lang_label(lang_name: str) -> str:
     """返回带 LCID 编码的语言标签，如 '英语 [1033]'。"""
-    lcid = LANGUAGE_LCID.get(lang_name, "")
+    clean_name = normalize_language_name(lang_name)
+    lcid = LANGUAGE_LCID.get(clean_name, "")
     if lcid:
-        return f"{lang_name} [{lcid}]"
-    return lang_name
+        return f"{clean_name} [{lcid}]"
+    return clean_name or lang_name
 # ============================================================
 
 # 百度翻译语言代码
@@ -238,8 +248,9 @@ class D365TranslationManager:
         if not text.strip():
             return ""
 
-        if lang_name in YOUDAO_LANGUAGES:
-            lang_code = YOUDAO_LANG_CODES.get(lang_name, "en")
+        clean_lang_name = normalize_language_name(lang_name)
+        if clean_lang_name in YOUDAO_LANGUAGES:
+            lang_code = YOUDAO_LANG_CODES.get(clean_lang_name, "en")
             return translate_youdao(
                 text,
                 lang_code,
@@ -248,7 +259,7 @@ class D365TranslationManager:
                 self.youdao_api_url,
             )
         else:
-            lang_code = BAIDU_LANG_CODES.get(lang_name, "en")
+            lang_code = BAIDU_LANG_CODES.get(clean_lang_name, "en")
             return translate_baidu(
                 text,
                 lang_code,

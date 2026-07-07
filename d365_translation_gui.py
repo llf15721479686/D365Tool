@@ -14,7 +14,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional, Set
 
-from d365_translation_manager import D365TranslationManager, LANGUAGE_LCID, get_lang_label
+from d365_translation_manager import D365TranslationManager, LANGUAGE_LCID, get_lang_label, normalize_language_name
 
 MAX_RETRIES = 3
 RETRY_DELAY_S = 0.5
@@ -456,7 +456,7 @@ class TranslationPanel:
         if not hasattr(self.gui, "op_logger"):
             return None
         try:
-            return self.gui.op_logger.get_cached_translation(text, lang)
+            return self.gui.op_logger.get_cached_translation(text, normalize_language_name(lang))
         except Exception as exc:
             self.gui._append_log(f"[实体翻译] 读取缓存失败：{exc}")
             return None
@@ -465,10 +465,11 @@ class TranslationPanel:
         if not hasattr(self.gui, "op_logger"):
             return
         try:
+            clean_lang = normalize_language_name(lang)
             self.gui.op_logger.upsert_cached_translation(
                 text,
-                lang,
-                get_lang_label(lang),
+                clean_lang,
+                get_lang_label(clean_lang),
                 self._normalize_cell_value(translated),
             )
         except Exception as exc:
@@ -502,7 +503,7 @@ class TranslationPanel:
     def _needs_openai_fallback(self, source_text: str, translated_text: str, lang: str) -> bool:
         source = self._normalize_for_compare(source_text)
         translated = self._normalize_for_compare(translated_text)
-        return bool(source and translated and source == translated and lang != "汉语")
+        return bool(source and translated and source == translated and normalize_language_name(lang) != "汉语")
 
     @staticmethod
     def _normalize_for_compare(value: str) -> str:
@@ -619,7 +620,7 @@ class TranslationPanel:
         return {lcid: lang for lang, lcid in LANGUAGE_LCID.items()}
 
     def _selected_import_langs(self) -> List[str]:
-        selected_lcids = {LANGUAGE_LCID.get(lang, "") for lang in self._active_languages_sorted()}
+        selected_lcids = {LANGUAGE_LCID.get(normalize_language_name(lang), "") for lang in self._active_languages_sorted()}
         selected_lcids.discard("")
         selected_lcids.discard("2052")
         lcid_to_lang = self._lcid_to_lang()

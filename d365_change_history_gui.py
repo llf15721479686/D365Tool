@@ -116,6 +116,7 @@ class D365ChangeHistoryPanel:
 
         self.entity_var = tk.StringVar()
         self.keyword_var = tk.StringVar()
+        self.modifiedby_var = tk.StringVar()
         if self.kind == "field":
             ttk.Label(toolbar, text="表名").grid(row=0, column=3, sticky="w", padx=(0, 4))
             entity_entry = ttk.Entry(toolbar, textvariable=self.entity_var, width=26)
@@ -127,8 +128,12 @@ class D365ChangeHistoryPanel:
             self._fill_default_entity()
         else:
             ttk.Label(toolbar, text="插件/类/步骤").grid(row=0, column=3, sticky="w", padx=(0, 4))
-            keyword_entry = ttk.Entry(toolbar, textvariable=self.keyword_var, width=32)
-            keyword_entry.grid(row=0, column=4, columnspan=3, sticky="w", padx=(0, 8))
+            keyword_entry = ttk.Entry(toolbar, textvariable=self.keyword_var, width=28)
+            keyword_entry.grid(row=0, column=4, sticky="w", padx=(0, 8))
+            ttk.Label(toolbar, text="修改人").grid(row=0, column=5, sticky="w", padx=(0, 4))
+            modifiedby_entry = ttk.Entry(toolbar, textvariable=self.modifiedby_var, width=24)
+            modifiedby_entry.grid(row=0, column=6, sticky="w", padx=(0, 8))
+            modifiedby_entry.bind("<Return>", lambda _event: self._on_filter_changed())
 
         keyword_entry.bind("<Return>", lambda _event: self._on_filter_changed())
         ttk.Button(toolbar, text="刷新", command=self._on_filter_changed).grid(row=0, column=7, sticky="w")
@@ -199,12 +204,13 @@ class D365ChangeHistoryPanel:
             return
 
         keyword = self.keyword_var.get().strip()
+        modifiedby_keyword = self.modifiedby_var.get().strip() if self.kind == "plugin" else ""
         entity = self.entity_var.get().strip() if self.kind == "field" else ""
         if self.kind == "field" and (not entity or not keyword):
             self.status_var.set("请输入表名和字段名后刷新，避免一次查询过多字段。")
             self._set_rows([], 0)
             return
-        if self.kind == "plugin" and not keyword:
+        if self.kind == "plugin" and not keyword and not modifiedby_keyword:
             self.status_var.set("请输入插件名称、类名或步骤名称后刷新，避免一次查询过多插件数据。")
             self._set_rows([], 0)
             return
@@ -222,7 +228,7 @@ class D365ChangeHistoryPanel:
                 if self.kind == "field":
                     rows, total = self._load_field_rows(creator, entity, keyword, page_size, offset)
                 else:
-                    rows, total = self._load_plugin_rows(creator, keyword, page_size, offset)
+                    rows, total = self._load_plugin_rows(creator, keyword, modifiedby_keyword, page_size, offset)
                 error = ""
             except Exception as exc:
                 rows, total, error = [], 0, str(exc)
@@ -325,35 +331,37 @@ class D365ChangeHistoryPanel:
             "details": f"Schema={schema}; Type={item.get('AttributeType', '')}; Custom={item.get('IsCustomAttribute', '')}",
         }
 
-    def _load_plugin_rows(self, creator: Any, keyword: str, top: int, skip: int) -> Tuple[List[Dict[str, Any]], int]:
+    def _load_plugin_rows(self, creator: Any, keyword: str, modifiedby_keyword: str, top: int, skip: int) -> Tuple[List[Dict[str, Any]], int]:
         safe_kw = _odata_text(keyword)
+        has_keyword = bool(keyword.strip())
         queries = [
             (
                 "pluginassemblies",
                 "程序集",
                 "pluginassemblyid,name,version,modifiedon,_modifiedby_value",
-                f"contains(name,'{safe_kw}')",
+                f"contains(name,'{safe_kw}')" if has_keyword else "",
             ),
             (
                 "plugintypes",
                 "插件类型",
                 "plugintypeid,name,typename,friendlyname,modifiedon,_modifiedby_value",
-                f"contains(name,'{safe_kw}') or contains(typename,'{safe_kw}') or contains(friendlyname,'{safe_kw}')",
+                f"contains(name,'{safe_kw}') or contains(typename,'{safe_kw}') or contains(friendlyname,'{safe_kw}')" if has_keyword else "",
             ),
             (
                 "sdkmessageprocessingsteps",
                 "处理步骤",
                 "sdkmessageprocessingstepid,name,stage,mode,rank,modifiedon,_modifiedby_value",
-                f"contains(name,'{safe_kw}')",
+                f"contains(name,'{safe_kw}')" if has_keyword else "",
             ),
         ]
         rows: List[Dict[str, Any]] = []
         for table, label, select, filter_text in queries:
-            filter_query = quote(filter_text, safe="(),='$")
+            filter_query = quote(filter_text, safe="(),='$") if filter_text else ""
+            filter_part = f"&$filter={filter_query}" if filter_query else ""
             url = (
                 f"{creator.api_base}/{table}?$select={select}"
-                f"&$filter={filter_query}"
-                f"&$orderby=modifiedon desc&$top=200"
+                f"{filter_part}"
+                f"&$orderby=modifiedon desc&$top=500"
             )
             data = self._request_json(creator, url)
             for item in data.get("value", []):
@@ -371,6 +379,14 @@ class D365ChangeHistoryPanel:
                     }
                 )
         self._attach_domain_users(creator, rows)
+        modifier_keyword = modifiedby_keyword.strip().lower()
+        if modifier_keyword:
+            rows = [
+                row
+                for row in rows
+                if modifier_keyword in str(row.get("modifiedby", "")).lower()
+                or modifier_keyword in str(row.get("modifiedby_id", "")).lower()
+            ]
         rows.sort(key=lambda r: r.get("modifiedon") or "", reverse=True)
         total = len(rows)
         return rows[skip : skip + top], total

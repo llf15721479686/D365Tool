@@ -661,7 +661,7 @@ class OperationLogger:
                     SELECT *
                     FROM local_crm_tables
                     {where_sql}
-                    ORDER BY updated_at DESC, logical_name ASC
+                    ORDER BY last_refreshed_at DESC, updated_at DESC, logical_name ASC
                     """,
                     params,
                 ).fetchall()

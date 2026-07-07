@@ -378,6 +378,49 @@ class D365FieldCreator:
                 break
         return sorted(set(names))
 
+    def list_all_entity_infos(self, progress_callback: Optional[Any] = None) -> List[Dict[str, Any]]:
+        select = (
+            "LogicalName,SchemaName,DisplayName,ObjectTypeCode,"
+            "IsCustomEntity,IsActivity,PrimaryIdAttribute,PrimaryNameAttribute"
+        )
+        url: Optional[str] = f"{self.api_base}/EntityDefinitions?$select={select}"
+        rows: List[Dict[str, Any]] = []
+        page_count = 0
+        while url:
+            resp = requests.get(url, headers=self.headers, timeout=120)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Load entity list failed: {resp.status_code}, {resp.text}")
+            body = resp.json()
+            page_count += 1
+            for row in body.get("value", []):
+                logical_name = str(row.get("LogicalName", "") or "").strip()
+                if not logical_name:
+                    continue
+                display_name_zh, display_name_en = _parse_display_name_labels(row.get("DisplayName"))
+                if not display_name_en:
+                    display_name_en = _format_localized_label(row.get("DisplayName"))
+                if display_name_zh == display_name_en and not _has_chinese_char(display_name_zh):
+                    display_name_zh = ""
+                rows.append(
+                    {
+                        "logical_name": logical_name,
+                        "schema_name": str(row.get("SchemaName", "") or ""),
+                        "display_name_zh": display_name_zh,
+                        "display_name_en": display_name_en,
+                        "display_name": _join_display_names(display_name_zh, display_name_en),
+                        "object_type_code": row.get("ObjectTypeCode"),
+                        "is_custom_entity": bool(row.get("IsCustomEntity")),
+                        "is_activity": bool(row.get("IsActivity")),
+                        "primary_id_attribute": str(row.get("PrimaryIdAttribute", "") or ""),
+                        "primary_name_attribute": str(row.get("PrimaryNameAttribute", "") or ""),
+                    }
+                )
+            if progress_callback:
+                progress_callback(f"已读取 CRM 表清单 {len(rows)} 张...")
+            url = body.get("@odata.nextLink")
+        rows.sort(key=lambda x: str(x.get("logical_name", "")).lower())
+        return rows
+
     def search_entities(
         self,
         keyword: str,
@@ -835,6 +878,25 @@ class D365FieldCreator:
             "primary_id_attribute": str(row.get("PrimaryIdAttribute", "")),
             "primary_name_attribute": str(row.get("PrimaryNameAttribute", "")),
         }
+
+    def get_entity_attribute_count(self, logical_name: str) -> int:
+        ln = logical_name.strip()
+        if not ln:
+            raise ValueError("实体逻辑名不能为空")
+        escaped = ln.replace("'", "''")
+        url = (
+            f"{self.api_base}/EntityDefinitions(LogicalName='{escaped}')/Attributes"
+            "?$select=MetadataId&$count=true&$top=1"
+        )
+        resp = requests.get(url, headers=self.headers, timeout=60)
+        if resp.status_code == 404:
+            raise RuntimeError(f"未找到数据表: {ln}")
+        if resp.status_code >= 400:
+            raise RuntimeError(f"查询字段数量失败: HTTP {resp.status_code}, {resp.text}")
+        body = resp.json()
+        if "@odata.count" in body:
+            return int(body.get("@odata.count") or 0)
+        return len(body.get("value", []))
 
     def list_entity_attributes(self, logical_name: str) -> List[Dict[str, Any]]:
         ln = logical_name.strip()
@@ -1321,6 +1383,59 @@ class D365FieldCreator:
         if progress_callback:
             progress_callback(100.0, "导入完成")
         return import_job_id
+
+    def get_active_solution_operations(self) -> List[Dict[str, Any]]:
+        active: List[Dict[str, Any]] = []
+        names = ("ImportSolution", "PublishAllXml", "Publish")
+        name_filter = " or ".join(f"name eq '{name}'" for name in names)
+        url = (
+            f"{self.api_base}/asyncoperations?"
+            f"$select=asyncoperationid,name,createdon,completedon,statecode,statuscode&"
+            f"$filter=({name_filter}) and completedon eq null&"
+            f"$orderby=createdon desc&$top=20"
+        )
+        try:
+            resp = self._api_get(url, timeout=60)
+            rows = resp.json().get("value", [])
+        except Exception:
+            rows = []
+        active.extend(dict(row) for row in rows)
+
+        history_select = "msdyn_solutionhistoryid,msdyn_name,msdyn_starttime,msdyn_operation,msdyn_status,msdyn_endtime"
+        history_url = (
+            f"{self.api_base}/msdyn_solutionhistories?"
+            f"$select={history_select}&"
+            f"$filter=(msdyn_operation eq 0 or msdyn_operation eq 3) and msdyn_status eq 0 and msdyn_endtime eq null&"
+            f"$orderby=msdyn_starttime desc&$top=20"
+        )
+        try:
+            history_resp = self._api_get(history_url, timeout=60)
+            for row in history_resp.json().get("value", []):
+                item = dict(row)
+                item["name"] = item.get("msdyn_name") or ("ImportSolution" if item.get("msdyn_operation") == 0 else "PublishAllXml")
+                active.append(item)
+        except Exception:
+            pass
+        return active
+
+    def wait_for_solution_operations_idle(
+        self,
+        *,
+        progress_callback: Optional[Any] = None,
+        poll_seconds: int = 30,
+    ) -> None:
+        while True:
+            active_jobs = self.get_active_solution_operations()
+            if not active_jobs:
+                if progress_callback:
+                    progress_callback("目标环境当前没有进行中的导入/发布，开始导入。")
+                return
+            job_names = ", ".join(str(job.get("name") or "作业") for job in active_jobs[:3])
+            if progress_callback:
+                progress_callback(
+                    f"目标环境有 {len(active_jobs)} 个进行中的导入/发布作业（{job_names}），已排队等待 {poll_seconds} 秒后重试..."
+                )
+            time.sleep(max(5, int(poll_seconds)))
 
     def publish_all_customizations(self) -> None:
         url = f"{self.api_base}/PublishAllXml"
@@ -2262,6 +2377,8 @@ class FieldCreatorGUI:
     def _on_window_close(self) -> None:
         if hasattr(self, "js_capture_panel"):
             self.js_capture_panel.stop_capture(terminate_browser=True)
+        if hasattr(self, "logs_auto_refresh_job"):
+            self._cancel_logs_auto_refresh()
         self._log_op("system", "app_close", "success", "用户关闭 D365 开发工具")
         if hasattr(self, "op_logger"):
             self.op_logger.end_session(self._session_id, status="closed")
@@ -2290,12 +2407,16 @@ class FieldCreatorGUI:
                 self.publish_history_panel.on_hide()
         if previous_panel == "local_table_store" and panel_id != "local_table_store":
             self._cancel_local_table_auto_refresh()
+        if previous_panel == "logs" and panel_id != "logs":
+            self._cancel_logs_auto_refresh()
         frame.tkraise()
         self._active_panel = panel_id
         if panel_id == "deploy":
             self._refresh_deploy_panel()
         elif panel_id == "logs":
             self._refresh_logs_panel()
+            if hasattr(self, "logs_auto_refresh_var") and self.logs_auto_refresh_var.get():
+                self._schedule_logs_auto_refresh()
         elif panel_id == "translation_records":
             self._refresh_translation_records_panel()
         elif panel_id == "local_table_store":
@@ -3382,8 +3503,21 @@ namespace D365ModelTemplate
         return env
 
     def _build_local_table_store_panel(self, parent: ttk.Frame) -> None:
+        environments = load_environments(self._get_config_path())
+        self.local_table_query_env_map: Dict[str, Dict[str, str]] = {}
+        local_env_names: List[str] = []
+        for env in environments:
+            name = str(env.get("name", "")).strip()
+            if name and name not in self.local_table_query_env_map:
+                self.local_table_query_env_map[name] = env
+                local_env_names.append(name)
+        cfg = load_config(self._get_config_path())
+        default_env_name = str(cfg.get("environment_name", "")).strip()
+        if default_env_name not in self.local_table_query_env_map and local_env_names:
+            default_env_name = local_env_names[0]
+
         parent.rowconfigure(2, weight=1)
-        parent.rowconfigure(4, weight=2)
+        parent.rowconfigure(5, weight=2)
         parent.columnconfigure(0, weight=1)
 
         toolbar = ttk.Frame(parent, padding=(8, 8, 8, 4))
@@ -3397,10 +3531,12 @@ namespace D365ModelTemplate
         keyword_entry = ttk.Entry(toolbar, textvariable=self.local_table_keyword_var)
         keyword_entry.grid(row=0, column=2, sticky="ew", padx=(0, 8))
         keyword_entry.bind("<Return>", lambda _e: self._refresh_local_table_store_panel())
+        keyword_entry.bind("<KeyRelease>", lambda _e: self._refresh_local_table_store_panel())
         ttk.Button(toolbar, text="筛选", command=self._refresh_local_table_store_panel).grid(row=0, column=3, padx=(0, 8))
 
-        ttk.Button(toolbar, text="立即更新全部", command=self._refresh_all_local_tables_from_crm).grid(row=0, column=4, padx=(0, 8))
-        ttk.Button(toolbar, text="更新选中表", command=self._refresh_selected_local_table_from_crm).grid(row=0, column=5, padx=(0, 8))
+        ttk.Button(toolbar, text="查询CRM所有表", command=self._open_import_all_crm_tables_dialog).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(toolbar, text="更新已修改表", command=self._open_refresh_changed_local_tables_dialog).grid(row=0, column=5, padx=(0, 8))
+        ttk.Button(toolbar, text="更新选中表", command=self._refresh_selected_local_table_from_crm).grid(row=0, column=6, padx=(0, 8))
 
         self.local_table_auto_refresh_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -3408,7 +3544,24 @@ namespace D365ModelTemplate
             text="自动刷新(30秒)",
             variable=self.local_table_auto_refresh_var,
             command=self._on_local_table_auto_refresh_toggle,
-        ).grid(row=0, column=6, sticky="w")
+        ).grid(row=0, column=7, sticky="w")
+
+        self.local_table_progress_var = tk.DoubleVar(value=0)
+        ttk.Label(toolbar, text="目标环境").grid(row=1, column=0, sticky="w", pady=(6, 0), padx=(0, 6))
+        self.local_table_query_env_var = tk.StringVar(value=default_env_name)
+        ttk.Combobox(
+            toolbar,
+            textvariable=self.local_table_query_env_var,
+            state="readonly",
+            values=local_env_names,
+            width=16,
+        ).grid(row=1, column=1, sticky="w", pady=(6, 0), padx=(0, 8))
+        self.local_table_progress = ttk.Progressbar(toolbar, maximum=100, variable=self.local_table_progress_var)
+        self.local_table_progress.grid(row=1, column=2, columnspan=4, sticky="ew", pady=(6, 0), padx=(0, 8))
+        self.local_table_progress_percent_var = tk.StringVar(value="0%")
+        ttk.Label(toolbar, textvariable=self.local_table_progress_percent_var, width=7).grid(
+            row=1, column=6, sticky="w", pady=(6, 0)
+        )
 
         self.local_table_status_var = tk.StringVar(value="数据表查询成功后会自动保存到这里。")
         ttk.Label(parent, textvariable=self.local_table_status_var, foreground="#666").grid(
@@ -3443,20 +3596,40 @@ namespace D365ModelTemplate
         self.local_table_tree.configure(yscrollcommand=table_y.set)
         self.local_table_tree.bind("<<TreeviewSelect>>", self._on_local_table_selected)
 
+        self.local_table_pager = PaginationBar(
+            table_frame,
+            page_size_options=(100, 200, 500),
+            default_page_size=100,
+            on_change=self._render_local_table_page,
+        )
+        self.local_table_pager.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
         self.local_table_info_var = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.local_table_info_var, foreground="#333").grid(
             row=3, column=0, sticky="w", padx=8, pady=(0, 4)
         )
 
+        field_filter = ttk.Frame(parent, padding=(8, 0, 8, 4))
+        field_filter.grid(row=4, column=0, sticky="ew")
+        field_filter.columnconfigure(1, weight=1)
+        ttk.Label(field_filter, text="字段搜索").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.local_table_field_keyword_var = tk.StringVar()
+        field_keyword_entry = ttk.Entry(field_filter, textvariable=self.local_table_field_keyword_var)
+        field_keyword_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        field_keyword_entry.bind("<KeyRelease>", lambda _e: self._apply_local_table_field_filter())
+        ttk.Button(field_filter, text="筛选字段", command=self._apply_local_table_field_filter).grid(row=0, column=2, sticky="e")
+
         field_frame = ttk.LabelFrame(parent, text="本地字段缓存", padding=4)
-        field_frame.grid(row=4, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        field_frame.grid(row=5, column=0, sticky="nsew", padx=8, pady=(0, 8))
         field_frame.rowconfigure(0, weight=1)
         field_frame.columnconfigure(0, weight=1)
         self.local_table_field_tree = self._create_table_query_field_tree(field_frame)
 
         self.local_table_rows: List[Dict[str, Any]] = []
         self.local_table_row_map: Dict[str, Dict[str, Any]] = {}
+        self.local_table_current_fields: List[Dict[str, Any]] = []
         self.local_table_refreshing = False
+        self.local_table_bulk_loading = False
         self.local_table_auto_refresh_job: Optional[str] = None
         self._refresh_local_table_store_panel()
 
@@ -3466,10 +3639,29 @@ namespace D365ModelTemplate
         keyword = self.local_table_keyword_var.get().strip() if hasattr(self, "local_table_keyword_var") else ""
         rows = self.op_logger.list_local_crm_tables(keyword)
         self.local_table_rows = rows
+        if hasattr(self, "local_table_pager"):
+            self.local_table_pager.page = 1
+        self._render_local_table_page()
+        self.local_table_status_var.set(f"本地共 {len(rows)} 张表。")
+        self.local_table_current_fields = []
+        self._populate_table_query_tree(self.local_table_field_tree, [])
+        self.local_table_info_var.set("")
+
+    def _render_local_table_page(self) -> None:
+        if not hasattr(self, "local_table_tree"):
+            return
+        rows = list(getattr(self, "local_table_rows", []))
         self.local_table_row_map = {}
         for item in self.local_table_tree.get_children():
             self.local_table_tree.delete(item)
-        for row in rows:
+        if hasattr(self, "local_table_pager"):
+            self.local_table_pager.set_total(len(rows))
+            page_size = self.local_table_pager.page_size()
+            start = (max(1, self.local_table_pager.page) - 1) * page_size
+            page_rows = rows[start : start + page_size]
+        else:
+            page_rows = rows
+        for row in page_rows:
             item_id = str(row.get("id"))
             display = _join_display_names(str(row.get("display_name_zh") or ""), str(row.get("display_name_en") or ""))
             self.local_table_tree.insert(
@@ -3482,13 +3674,10 @@ namespace D365ModelTemplate
                     display,
                     row.get("schema_name", ""),
                     row.get("field_count", 0),
-                    row.get("last_refreshed_at", ""),
+                    self._format_log_time(str(row.get("last_refreshed_at", ""))),
                 ),
             )
             self.local_table_row_map[item_id] = row
-        self.local_table_status_var.set(f"本地共 {len(rows)} 张表。")
-        self._populate_table_query_tree(self.local_table_field_tree, [])
-        self.local_table_info_var.set("")
 
     def _on_local_table_selected(self, _event: Any = None) -> None:
         selection = self.local_table_tree.selection()
@@ -3498,11 +3687,298 @@ namespace D365ModelTemplate
         if not row:
             return
         fields = self.op_logger.list_local_crm_table_fields(int(row["id"]))
-        self._populate_table_query_tree(self.local_table_field_tree, fields)
+        self.local_table_current_fields = fields
+        self._apply_local_table_field_filter()
         display = _join_display_names(str(row.get("display_name_zh") or ""), str(row.get("display_name_en") or "")) or "-"
         self.local_table_info_var.set(
             f"环境: {row.get('environment_name', '')} | 表: {row.get('logical_name', '')} | 显示名: {display} | 字段数: {len(fields)}"
         )
+
+    def _apply_local_table_field_filter(self) -> None:
+        if not hasattr(self, "local_table_field_tree"):
+            return
+        keyword = self.local_table_field_keyword_var.get().strip().lower() if hasattr(self, "local_table_field_keyword_var") else ""
+        rows = list(getattr(self, "local_table_current_fields", []))
+        if keyword:
+            rows = [
+                row
+                for row in rows
+                if keyword in str(row.get("logical_name", "")).lower()
+                or keyword in str(row.get("schema_name", "")).lower()
+                or keyword in str(row.get("display_name_zh", "")).lower()
+                or keyword in str(row.get("display_name_en", "")).lower()
+                or keyword in str(row.get("attribute_type", "")).lower()
+            ]
+        self._populate_table_query_tree(self.local_table_field_tree, rows)
+
+    def _get_local_table_query_environment(self) -> Dict[str, str]:
+        env_name = self.local_table_query_env_var.get().strip() if hasattr(self, "local_table_query_env_var") else ""
+        env = getattr(self, "local_table_query_env_map", {}).get(env_name)
+        if not env:
+            raise RuntimeError("请选择目标环境")
+        return env
+
+    def _set_local_table_progress(self, current: int, total: int, message: str = "") -> None:
+        percent = 0 if total <= 0 else int(current * 100 / total)
+        if hasattr(self, "local_table_progress_var"):
+            self.local_table_progress_var.set(percent)
+        if hasattr(self, "local_table_progress_percent_var"):
+            self.local_table_progress_percent_var.set(f"{percent}%")
+        if message and hasattr(self, "local_table_status_var"):
+            self.local_table_status_var.set(message)
+
+    def _open_import_all_crm_tables_dialog(self) -> None:
+        if getattr(self, "local_table_bulk_loading", False):
+            return
+        try:
+            env = self._get_local_table_query_environment()
+        except Exception as exc:
+            messagebox.showwarning("提示", str(exc), parent=self.root)
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("查询CRM所有表")
+        dialog.geometry("900x600")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(2, weight=1)
+
+        status_var = tk.StringVar(value=f"正在读取 {env.get('name', '')} 的 CRM 表清单...")
+        ttk.Label(dialog, textvariable=status_var, foreground="#666").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+
+        filter_frame = ttk.Frame(dialog, padding=(8, 0, 8, 4))
+        filter_frame.grid(row=1, column=0, sticky="ew")
+        filter_frame.columnconfigure(1, weight=1)
+        ttk.Label(filter_frame, text="模糊查找").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        keyword_var = tk.StringVar()
+        keyword_entry = ttk.Entry(filter_frame, textvariable=keyword_var)
+        keyword_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+
+        tree_frame = ttk.Frame(dialog, padding=(8, 0, 8, 4))
+        tree_frame.grid(row=2, column=0, sticky="nsew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        tree = ttk.Treeview(
+            tree_frame,
+            columns=("logical_name", "display_name", "schema_name", "type"),
+            show="headings",
+            selectmode="extended",
+        )
+        for column, title, width in (
+            ("logical_name", "逻辑名", 220),
+            ("display_name", "显示名", 320),
+            ("schema_name", "Schema名", 220),
+            ("type", "类型", 90),
+        ):
+            tree.heading(column, text=title)
+            tree.column(column, width=width, anchor="w", stretch=(column in {"display_name", "schema_name"}))
+        tree.grid(row=0, column=0, sticky="nsew")
+        ybar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        ybar.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=ybar.set)
+
+        button_frame = ttk.Frame(dialog, padding=(8, 4, 8, 8))
+        button_frame.grid(row=3, column=0, sticky="ew")
+        button_frame.columnconfigure(0, weight=1)
+        button_frame.columnconfigure(1, weight=1)
+        button_frame.columnconfigure(2, weight=1)
+
+        all_rows: List[Dict[str, Any]] = []
+        row_map: Dict[str, Dict[str, Any]] = {}
+        clean_org_url = str(env.get("org_url", "")).strip().rstrip("/").lower()
+        saved_logical_names = {
+            str(row.get("logical_name", "")).strip().lower()
+            for row in self.op_logger.list_local_crm_tables("")
+            if str(row.get("org_url", "")).strip().rstrip("/").lower() == clean_org_url
+        }
+
+        def render() -> None:
+            keyword = keyword_var.get().strip().lower()
+            tree.delete(*tree.get_children())
+            row_map.clear()
+            filtered = []
+            for row in all_rows:
+                display = _join_display_names(str(row.get("display_name_zh") or ""), str(row.get("display_name_en") or ""))
+                haystack = " ".join(
+                    [
+                        str(row.get("logical_name", "")),
+                        str(row.get("schema_name", "")),
+                        display,
+                    ]
+                ).lower()
+                if keyword and keyword not in haystack:
+                    continue
+                filtered.append(row)
+                iid = str(row.get("logical_name", ""))
+                tree.insert(
+                    "",
+                    "end",
+                    iid=iid,
+                    values=(
+                        row.get("logical_name", ""),
+                        display,
+                        row.get("schema_name", ""),
+                        "自定义" if row.get("is_custom_entity") else "系统",
+                    ),
+                )
+                row_map[iid] = row
+            status_var.set(
+                f"未保存表 {len(all_rows)} 张，当前筛选 {len(filtered)} 张，已自动隐藏本地已保存表。按住 Ctrl 或 Shift 可多选。"
+            )
+
+        def select_all_visible() -> None:
+            tree.selection_set(tree.get_children())
+
+        def confirm() -> None:
+            selected = [row_map[item] for item in tree.selection() if item in row_map]
+            if not selected:
+                messagebox.showwarning("提示", "请先选择要保存的表。", parent=dialog)
+                return
+            dialog.destroy()
+            self._import_selected_crm_tables_to_local(env, selected)
+
+        ttk.Button(button_frame, text="全选当前列表", command=select_all_visible).grid(row=0, column=0, sticky="w")
+        ttk.Button(button_frame, text="确认添加到本地表存储", command=confirm).grid(row=0, column=1)
+        ttk.Button(button_frame, text="关闭", command=dialog.destroy).grid(row=0, column=2, sticky="e")
+
+        keyword_entry.bind("<KeyRelease>", lambda _e: render())
+
+        def worker() -> None:
+            try:
+                creator = self._create_creator_for_environment(env)
+                rows = creator.list_all_entity_infos(
+                    progress_callback=lambda msg: self.root.after(0, lambda m=msg: status_var.set(m))
+                )
+
+                def on_done() -> None:
+                    all_rows.extend(
+                        row
+                        for row in rows
+                        if str(row.get("logical_name", "")).strip().lower() not in saved_logical_names
+                    )
+                    render()
+
+                self.root.after(0, on_done)
+            except Exception as exc:
+                msg = _format_exception(exc)
+                self.root.after(0, lambda: messagebox.showerror("错误", msg, parent=dialog))
+                self.root.after(0, lambda: status_var.set(f"查询失败: {msg}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _import_selected_crm_tables_to_local(self, env: Dict[str, str], rows: List[Dict[str, Any]]) -> None:
+        if getattr(self, "local_table_bulk_loading", False):
+            return
+        self.local_table_bulk_loading = True
+        total = len(rows)
+        env_name = str(env.get("name", ""))
+        env_url = str(env.get("org_url", ""))
+        self._set_local_table_progress(0, total, f"准备保存 {total} 张表到本地...")
+
+        def worker() -> None:
+            saved = 0
+            failed: List[str] = []
+            try:
+                creator = self._create_creator_for_environment(env)
+                for index, row in enumerate(rows, start=1):
+                    logical_name = str(row.get("logical_name", "")).strip()
+                    self.root.after(
+                        0,
+                        lambda i=index, name=logical_name: self._set_local_table_progress(
+                            i - 1, total, f"正在保存 {i}/{total}: {name}"
+                        ),
+                    )
+                    try:
+                        entity_info = dict(row)
+                        if not entity_info.get("schema_name"):
+                            entity_info = creator.get_entity_info(logical_name)
+                        attributes = creator.list_entity_attributes(logical_name)
+                        self.op_logger.upsert_local_crm_table(
+                            environment_name=env_name,
+                            org_url=env_url,
+                            entity_info=entity_info,
+                            fields=attributes,
+                        )
+                        saved += 1
+                        self._log_op(
+                            "local_table_store",
+                            "bulk_import_table",
+                            "success",
+                            f"本地表保存成功: {logical_name}",
+                            details={
+                                "environment_name": env_name,
+                                "org_url": env_url,
+                                "entity": logical_name,
+                                "field_count": len(attributes),
+                            },
+                            target_org_url=env_url,
+                            environment_name=env_name,
+                            entity_name=logical_name,
+                        )
+                    except Exception as exc:
+                        err_msg = _format_exception(exc)
+                        failed.append(f"{logical_name}: {err_msg}")
+                        self._log_op(
+                            "local_table_store",
+                            "bulk_import_table",
+                            "failed",
+                            f"本地表保存失败: {logical_name}",
+                            details={
+                                "environment_name": env_name,
+                                "org_url": env_url,
+                                "entity": logical_name,
+                                "source_row": sanitize_details(row),
+                            },
+                            target_org_url=env_url,
+                            environment_name=env_name,
+                            entity_name=logical_name,
+                            error_message=err_msg,
+                        )
+                    self.root.after(
+                        0,
+                        lambda i=index, name=logical_name: self._set_local_table_progress(
+                            i, total, f"已处理 {i}/{total}: {name}"
+                        ),
+                    )
+
+                def on_done() -> None:
+                    self.local_table_bulk_loading = False
+                    self._refresh_local_table_store_panel()
+                    msg = f"保存完成：成功 {saved} 张，失败 {len(failed)} 张。"
+                    if failed:
+                        msg += " " + "；".join(failed[:3])
+                    self._set_local_table_progress(total, total, msg)
+                    self._append_log(msg)
+                    self._log_op(
+                        "local_table_store",
+                        "bulk_import_tables",
+                        "success" if not failed else "failed",
+                        msg,
+                        details={
+                            "environment_name": env_name,
+                            "org_url": env_url,
+                            "total": total,
+                            "success": saved,
+                            "failed": len(failed),
+                            "failed_preview": failed[:50],
+                        },
+                        target_org_url=env_url,
+                        environment_name=env_name,
+                    )
+
+                self.root.after(0, on_done)
+            except Exception as exc:
+                msg = _format_exception(exc)
+
+                def on_error() -> None:
+                    self.local_table_bulk_loading = False
+                    self.local_table_status_var.set(f"保存失败: {msg}")
+                    messagebox.showerror("错误", msg, parent=self.root)
+
+                self.root.after(0, on_error)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _local_table_env_map(self) -> Dict[str, Dict[str, str]]:
         envs = load_environments(self._get_config_path())
@@ -3535,7 +4011,217 @@ namespace D365ModelTemplate
             return
         self._refresh_local_tables_from_crm(rows)
 
-    def _refresh_local_tables_from_crm(self, rows: List[Dict[str, Any]]) -> None:
+    def _open_refresh_changed_local_tables_dialog(self) -> None:
+        if getattr(self, "local_table_refreshing", False):
+            return
+        try:
+            env = self._get_local_table_query_environment()
+        except Exception as exc:
+            messagebox.showwarning("提示", str(exc), parent=self.root)
+            return
+
+        env_name = str(env.get("name", "")).strip()
+        env_url = str(env.get("org_url", "")).strip().rstrip("/")
+        clean_env_url = env_url.lower()
+        rows = [
+            row
+            for row in self.op_logger.list_local_crm_tables("")
+            if str(row.get("org_url", "")).strip().rstrip("/").lower() == clean_env_url
+        ]
+        if not rows:
+            self.local_table_status_var.set(f"{env_name} 还没有本地保存表。")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("更新已修改表")
+        dialog.geometry("980x620")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(2, weight=1)
+
+        status_var = tk.StringVar(value=f"正在检查 {env_name} 的 {len(rows)} 张本地表...")
+        ttk.Label(dialog, textvariable=status_var, foreground="#666").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+
+        filter_frame = ttk.Frame(dialog, padding=(8, 0, 8, 4))
+        filter_frame.grid(row=1, column=0, sticky="ew")
+        filter_frame.columnconfigure(1, weight=1)
+        ttk.Label(filter_frame, text="模糊查找").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        keyword_var = tk.StringVar()
+        keyword_entry = ttk.Entry(filter_frame, textvariable=keyword_var)
+        keyword_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+
+        tree_frame = ttk.Frame(dialog, padding=(8, 0, 8, 4))
+        tree_frame.grid(row=2, column=0, sticky="nsew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        tree = ttk.Treeview(
+            tree_frame,
+            columns=("logical_name", "display_name", "schema_name", "local_count", "crm_count", "last_refreshed_at"),
+            show="headings",
+            selectmode="extended",
+        )
+        for column, title, width in (
+            ("logical_name", "逻辑名", 200),
+            ("display_name", "显示名", 280),
+            ("schema_name", "Schema名", 220),
+            ("local_count", "本地字段数", 90),
+            ("crm_count", "CRM字段数", 90),
+            ("last_refreshed_at", "最后刷新", 150),
+        ):
+            tree.heading(column, text=title)
+            tree.column(column, width=width, anchor="w", stretch=(column in {"display_name", "schema_name"}))
+        tree.grid(row=0, column=0, sticky="nsew")
+        ybar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        ybar.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=ybar.set)
+
+        button_frame = ttk.Frame(dialog, padding=(8, 4, 8, 8))
+        button_frame.grid(row=3, column=0, sticky="ew")
+        button_frame.columnconfigure(0, weight=1)
+        button_frame.columnconfigure(1, weight=1)
+        button_frame.columnconfigure(2, weight=1)
+
+        changed_rows: List[Dict[str, Any]] = []
+        row_map: Dict[str, Dict[str, Any]] = {}
+        failed: List[str] = []
+
+        def render() -> None:
+            keyword = keyword_var.get().strip().lower()
+            tree.delete(*tree.get_children())
+            row_map.clear()
+            visible_count = 0
+            for row in changed_rows:
+                display = _join_display_names(str(row.get("display_name_zh") or ""), str(row.get("display_name_en") or ""))
+                haystack = " ".join(
+                    [
+                        str(row.get("logical_name", "")),
+                        str(row.get("schema_name", "")),
+                        display,
+                    ]
+                ).lower()
+                if keyword and keyword not in haystack:
+                    continue
+                visible_count += 1
+                iid = str(row.get("id"))
+                tree.insert(
+                    "",
+                    "end",
+                    iid=iid,
+                    values=(
+                        row.get("logical_name", ""),
+                        display,
+                        row.get("schema_name", ""),
+                        row.get("field_count", 0),
+                        row.get("crm_field_count", ""),
+                        self._format_log_time(str(row.get("last_refreshed_at", ""))),
+                    ),
+                )
+                row_map[iid] = row
+            suffix = f"，检查失败 {len(failed)} 张" if failed else ""
+            status_var.set(f"发现字段数量不一致 {len(changed_rows)} 张，当前显示 {visible_count} 张{suffix}。")
+
+        def select_all_visible() -> None:
+            tree.selection_set(tree.get_children())
+
+        def confirm() -> None:
+            selected = [row_map[item] for item in tree.selection() if item in row_map]
+            if not selected:
+                messagebox.showwarning("提示", "请先选择要同步的表。", parent=dialog)
+                return
+            names = [str(row.get("logical_name", "")).strip() for row in selected]
+            self._log_op(
+                "local_table_store",
+                "refresh_changed_tables_selected",
+                "started",
+                f"开始同步已修改本地表 {len(names)} 张",
+                details={"environment_name": env_name, "org_url": env_url, "tables": names},
+                target_org_url=env_url,
+                environment_name=env_name,
+            )
+            dialog.destroy()
+            self._refresh_local_tables_from_crm(selected, action_name="refresh_changed_tables", changed_table_names=names)
+
+        ttk.Button(button_frame, text="全选当前列表", command=select_all_visible).grid(row=0, column=0, sticky="w")
+        ttk.Button(button_frame, text="确认同步选中表", command=confirm).grid(row=0, column=1)
+        ttk.Button(button_frame, text="关闭", command=dialog.destroy).grid(row=0, column=2, sticky="e")
+        keyword_entry.bind("<KeyRelease>", lambda _e: render())
+
+        def worker() -> None:
+            try:
+                creator = self._create_creator_for_environment(env)
+                total = len(rows)
+                for index, row in enumerate(rows, start=1):
+                    logical_name = str(row.get("logical_name", "")).strip()
+                    self.root.after(
+                        0,
+                        lambda i=index, total_count=total, name=logical_name: status_var.set(
+                            f"正在检查 {i}/{total_count}: {name}"
+                        ),
+                    )
+                    try:
+                        crm_count = creator.get_entity_attribute_count(logical_name)
+                        local_count = int(row.get("field_count") or 0)
+                        if crm_count != local_count:
+                            changed = dict(row)
+                            changed["crm_field_count"] = crm_count
+                            changed_rows.append(changed)
+                    except Exception as exc:
+                        msg = f"{logical_name}: {_format_exception(exc)}"
+                        failed.append(msg)
+                        self._log_op(
+                            "local_table_store",
+                            "check_changed_table",
+                            "failed",
+                            f"检查已修改表失败: {logical_name}",
+                            details={"environment_name": env_name, "org_url": env_url, "entity": logical_name},
+                            target_org_url=env_url,
+                            environment_name=env_name,
+                            entity_name=logical_name,
+                            error_message=msg,
+                        )
+
+                def on_done() -> None:
+                    changed_rows.sort(key=lambda item: str(item.get("last_refreshed_at", "")), reverse=True)
+                    render()
+                    self._log_op(
+                        "local_table_store",
+                        "check_changed_tables",
+                        "success" if not failed else "failed",
+                        f"检查已修改表完成：发现 {len(changed_rows)} 张，失败 {len(failed)} 张",
+                        details={
+                            "environment_name": env_name,
+                            "org_url": env_url,
+                            "checked": len(rows),
+                            "changed": [
+                                {
+                                    "logical_name": row.get("logical_name"),
+                                    "local_field_count": row.get("field_count"),
+                                    "crm_field_count": row.get("crm_field_count"),
+                                }
+                                for row in changed_rows
+                            ],
+                            "failed_preview": failed[:50],
+                        },
+                        target_org_url=env_url,
+                        environment_name=env_name,
+                    )
+
+                self.root.after(0, on_done)
+            except Exception as exc:
+                msg = _format_exception(exc)
+                self.root.after(0, lambda: messagebox.showerror("错误", msg, parent=dialog))
+                self.root.after(0, lambda: status_var.set(f"检查失败: {msg}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _refresh_local_tables_from_crm(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        action_name: str = "refresh_local_tables",
+        changed_table_names: Optional[List[str]] = None,
+    ) -> None:
         if getattr(self, "local_table_refreshing", False):
             return
         self.local_table_refreshing = True
@@ -3572,6 +4258,21 @@ namespace D365ModelTemplate
                     msg += " " + "；".join(failed[:3])
                 self.local_table_status_var.set(msg)
                 self._append_log(msg)
+                names = changed_table_names or [str(row.get("logical_name", "")).strip() for row in rows]
+                self._log_op(
+                    "local_table_store",
+                    action_name,
+                    "success" if not failed else "failed",
+                    msg,
+                    details={
+                        "updated_tables": names,
+                        "success": updated,
+                        "failed": len(failed),
+                        "failed_preview": failed[:50],
+                    },
+                    environment_name=str(rows[0].get("environment_name", "")) if rows else "",
+                    target_org_url=str(rows[0].get("org_url", "")) if rows else "",
+                )
 
             self.root.after(0, on_done)
 
@@ -3603,7 +4304,7 @@ namespace D365ModelTemplate
     def _local_table_auto_refresh_tick(self) -> None:
         self.local_table_auto_refresh_job = None
         if self._active_panel == "local_table_store" and self.local_table_auto_refresh_var.get():
-            self._refresh_all_local_tables_from_crm()
+            self._refresh_local_table_store_panel()
             self._schedule_local_table_auto_refresh()
 
     def _build_translation_panel(self, parent: ttk.Frame) -> None:
@@ -5032,6 +5733,15 @@ namespace D365ModelTemplate
                                 f"{label} 正在导入到 {target_name}...",
                             ),
                         )
+                        target_creator.wait_for_solution_operations_idle(
+                            progress_callback=lambda message, i=index, label=step_label: self.root.after(
+                                0,
+                                lambda m=message, idx=i, lbl=label: _set_determinate_progress(
+                                    _overall_progress(idx, total, 0.0),
+                                    f"{lbl} {m}",
+                                ),
+                            )
+                        )
                         target_creator.import_solution(
                             solution_bytes=solution_bytes,
                             overwrite_unmanaged=overwrite_var.get(),
@@ -5525,6 +6235,13 @@ namespace D365ModelTemplate
             text="当前会话",
             command=lambda: self._refresh_logs_panel_for_session(self._session_id),
         ).grid(row=0, column=9)
+        self.logs_auto_refresh_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            toolbar,
+            text="自动刷新(5秒)",
+            variable=self.logs_auto_refresh_var,
+            command=self._on_logs_auto_refresh_toggle,
+        ).grid(row=0, column=10, padx=(12, 0), sticky="w")
 
         self.log_stats_var = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.log_stats_var, foreground="#666").grid(
@@ -5586,9 +6303,44 @@ namespace D365ModelTemplate
         self.log_detail_text.configure(yscrollcommand=detail_scroll.set, state="disabled")
 
         self._logs_data_map: Dict[str, Dict[str, Any]] = {}
+        self.logs_auto_refresh_job: Optional[str] = None
 
         self.logs_pager = PaginationBar(parent, default_page_size=2000, on_change=self._refresh_logs_panel)
         self.logs_pager.grid(row=3, column=0, sticky="w", padx=8, pady=(0, 6))
+
+    def _on_logs_auto_refresh_toggle(self) -> None:
+        if self.logs_auto_refresh_var.get():
+            self._refresh_logs_panel()
+            self._schedule_logs_auto_refresh()
+        else:
+            self._cancel_logs_auto_refresh()
+
+    def _schedule_logs_auto_refresh(self) -> None:
+        self._cancel_logs_auto_refresh()
+        if not hasattr(self, "logs_auto_refresh_var") or not self.logs_auto_refresh_var.get():
+            return
+        if self._active_panel != "logs":
+            return
+        self.logs_auto_refresh_job = self.root.after(5000, self._logs_auto_refresh_tick)
+
+    def _cancel_logs_auto_refresh(self) -> None:
+        job = getattr(self, "logs_auto_refresh_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except ValueError:
+                pass
+        self.logs_auto_refresh_job = None
+
+    def _logs_auto_refresh_tick(self) -> None:
+        self.logs_auto_refresh_job = None
+        if (
+            self._active_panel == "logs"
+            and hasattr(self, "logs_auto_refresh_var")
+            and self.logs_auto_refresh_var.get()
+        ):
+            self._refresh_logs_panel()
+            self._schedule_logs_auto_refresh()
 
     def _refresh_logs_panel_for_session(self, session_id: str) -> None:
         if not hasattr(self, "logs_tree") or not hasattr(self, "op_logger"):
