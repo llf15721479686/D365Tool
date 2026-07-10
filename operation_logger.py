@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -33,8 +33,8 @@ _SENSITIVE_KEYS = frozenset(
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
+    china_tz = timezone(timedelta(hours=8))
+    return datetime.now(china_tz).isoformat(timespec="milliseconds")
 
 def _mask_secret_value(value: str) -> str:
     text = str(value)
@@ -214,6 +214,30 @@ class OperationLogger:
 
                     CREATE INDEX IF NOT EXISTS idx_local_crm_table_fields_table
                         ON local_crm_table_fields(table_id, sort_order ASC, id ASC);
+
+                    CREATE TABLE IF NOT EXISTS local_global_option_values (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        environment_name TEXT NOT NULL,
+                        org_url TEXT NOT NULL,
+                        solution_name TEXT NOT NULL,
+                        option_set_metadata_id TEXT,
+                        option_set_name TEXT NOT NULL,
+                        option_set_display_name_zh TEXT,
+                        option_set_display_name_en TEXT,
+                        option_value INTEGER NOT NULL,
+                        label_zh TEXT,
+                        label_en TEXT,
+                        sort_order INTEGER NOT NULL DEFAULT 0,
+                        last_refreshed_at TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(org_url, solution_name, option_set_name, option_value)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_local_global_option_values_set
+                        ON local_global_option_values(org_url, solution_name, option_set_name, sort_order ASC);
+                    CREATE INDEX IF NOT EXISTS idx_local_global_option_values_updated_at
+                        ON local_global_option_values(updated_at DESC);
                     """
                 )
                 row = conn.execute(
@@ -681,6 +705,171 @@ class OperationLogger:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def replace_local_global_option_values(
+        self,
+        *,
+        environment_name: str,
+        org_url: str,
+        solution_name: str,
+        option_set: Dict[str, Any],
+        options: List[Dict[str, Any]],
+    ) -> None:
+        now = _utc_now_iso()
+        clean_org_url = str(org_url).strip().rstrip("/")
+        clean_solution = str(solution_name).strip()
+        option_set_name = str(option_set.get("name", "") or "").strip()
+        if not clean_org_url or not clean_solution or not option_set_name:
+            raise ValueError("global option values require org_url, solution_name and option_set_name")
+
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    DELETE FROM local_global_option_values
+                    WHERE org_url = ? AND solution_name = ? AND option_set_name = ?
+                    """,
+                    (clean_org_url, clean_solution, option_set_name),
+                )
+                for index, option in enumerate(options):
+                    value = option.get("value")
+                    if value is None:
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO local_global_option_values (
+                            environment_name, org_url, solution_name, option_set_metadata_id,
+                            option_set_name, option_set_display_name_zh, option_set_display_name_en,
+                            option_value, label_zh, label_en, sort_order,
+                            last_refreshed_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(environment_name).strip(),
+                            clean_org_url,
+                            clean_solution,
+                            str(option_set.get("metadata_id", "") or ""),
+                            option_set_name,
+                            str(option_set.get("display_name_zh", "") or ""),
+                            str(option_set.get("display_name_en", "") or ""),
+                            int(value),
+                            str(option.get("label_zh", "") or ""),
+                            str(option.get("label_en", "") or ""),
+                            index,
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                conn.commit()
+
+    def list_local_global_option_values(
+        self,
+        *,
+        org_url: str = "",
+        solution_name: str = "",
+        keyword: str = "",
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        clean_org_url = str(org_url).strip().rstrip("/")
+        if clean_org_url:
+            clauses.append("org_url = ?")
+            params.append(clean_org_url)
+        clean_solution = str(solution_name).strip()
+        if clean_solution:
+            clauses.append("solution_name = ?")
+            params.append(clean_solution)
+        clean_keyword = str(keyword or "").strip()
+        if clean_keyword:
+            like = f"%{clean_keyword}%"
+            clauses.append(
+                "(option_set_name LIKE ? OR option_set_display_name_zh LIKE ? OR "
+                "option_set_display_name_en LIKE ? OR label_zh LIKE ? OR label_en LIKE ?)"
+            )
+            params.extend([like, like, like, like, like])
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM local_global_option_values
+                    {where_sql}
+                    ORDER BY updated_at DESC, option_set_name ASC, sort_order ASC, id ASC
+                    """,
+                    params,
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_local_global_option_sets(self, keyword: str = "") -> List[Dict[str, Any]]:
+        params: List[Any] = []
+        where_sql = ""
+        clean_keyword = str(keyword or "").strip()
+        if clean_keyword:
+            like = f"%{clean_keyword}%"
+            where_sql = """
+            WHERE option_set_name LIKE ? OR option_set_display_name_zh LIKE ?
+                OR option_set_display_name_en LIKE ? OR solution_name LIKE ? OR environment_name LIKE ?
+            """
+            params.extend([like, like, like, like, like])
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                        MIN(id) AS id,
+                        environment_name,
+                        org_url,
+                        solution_name,
+                        option_set_metadata_id,
+                        option_set_name,
+                        option_set_display_name_zh,
+                        option_set_display_name_en,
+                        COUNT(*) AS option_count,
+                        MAX(last_refreshed_at) AS last_refreshed_at,
+                        MAX(updated_at) AS updated_at
+                    FROM local_global_option_values
+                    {where_sql}
+                    GROUP BY org_url, solution_name, option_set_name
+                    ORDER BY last_refreshed_at DESC, option_set_name ASC
+                    """,
+                    params,
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_local_global_option_set_values(
+        self,
+        *,
+        org_url: str,
+        solution_name: str,
+        option_set_name: str,
+        keyword: str = "",
+    ) -> List[Dict[str, Any]]:
+        clauses = ["org_url = ?", "solution_name = ?", "option_set_name = ?"]
+        params: List[Any] = [
+            str(org_url).strip().rstrip("/"),
+            str(solution_name).strip(),
+            str(option_set_name).strip(),
+        ]
+        clean_keyword = str(keyword or "").strip()
+        if clean_keyword:
+            like = f"%{clean_keyword}%"
+            clauses.append("(CAST(option_value AS TEXT) LIKE ? OR label_zh LIKE ? OR label_en LIKE ?)")
+            params.extend([like, like, like])
+        where_sql = "WHERE " + " AND ".join(clauses)
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM local_global_option_values
+                    {where_sql}
+                    ORDER BY sort_order ASC, option_value ASC, id ASC
+                    """,
+                    params,
+                ).fetchall()
+        return [dict(row) for row in rows]
+
     def _translation_cache_filter_sql(
         self,
         *,
@@ -769,10 +958,12 @@ class OperationLogger:
             params.append(status)
         if keyword:
             clauses.append(
-                "(summary LIKE ? OR action LIKE ? OR entity_name LIKE ? OR solution_name LIKE ? OR error_message LIKE ?)"
+                "(summary LIKE ? OR action LIKE ? OR category LIKE ? OR status LIKE ? "
+                "OR entity_name LIKE ? OR solution_name LIKE ? OR environment_name LIKE ? "
+                "OR org_url LIKE ? OR target_org_url LIKE ? OR error_message LIKE ? OR details_json LIKE ?)"
             )
             like = f"%{keyword}%"
-            params.extend([like, like, like, like, like])
+            params.extend([like, like, like, like, like, like, like, like, like, like, like])
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         return where_sql, params
 
@@ -798,7 +989,7 @@ class OperationLogger:
                     SELECT *
                     FROM operations
                     {where_sql}
-                    ORDER BY id DESC
+                    ORDER BY created_at DESC, id DESC
                     LIMIT ? OFFSET ?
                     """,
                     params,

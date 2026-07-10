@@ -153,6 +153,7 @@ PANEL_LABELS: Dict[str, str] = {
     "plugin": "插件注册",
     "plugin_changes": "插件变更记录",
     "js_capture": "脚本JS调试",
+    "global_option_set": "全局下拉值",
 }
 
 LOG_CATEGORY_LABELS: Dict[str, str] = {
@@ -172,6 +173,7 @@ LOG_CATEGORY_LABELS: Dict[str, str] = {
     "plugin": "插件注册",
     "plugin_changes": "插件变更记录",
     "js_capture": "脚本JS调试",
+    "global_option_set": "全局下拉值",
 }
 
 LOG_STATUS_LABELS: Dict[str, str] = {
@@ -577,10 +579,26 @@ class D365FieldCreator:
         return entities
 
     def _api_get(self, url: str, timeout: int = 60) -> requests.Response:
-        resp = requests.get(url, headers=self.headers, timeout=timeout)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"GET failed: HTTP {resp.status_code}, {resp.text}")
-        return resp
+        last_error: Optional[BaseException] = None
+        retry_statuses = {429, 500, 502, 503, 504}
+        headers = dict(self.headers)
+        headers["Connection"] = "close"
+        for attempt in range(1, 4):
+            try:
+                resp = requests.get(url, headers=headers, timeout=timeout)
+                if resp.status_code < 400:
+                    return resp
+                if resp.status_code not in retry_statuses or attempt >= 3:
+                    raise RuntimeError(f"GET failed: HTTP {resp.status_code}, {resp.text}")
+                last_error = RuntimeError(f"GET failed: HTTP {resp.status_code}, {resp.text}")
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt >= 3:
+                    raise RuntimeError(_format_exception(exc)) from exc
+            time.sleep(1.5 * attempt)
+        if last_error is not None:
+            raise RuntimeError(_format_exception(last_error))
+        raise RuntimeError("GET failed")
 
     def _api_post(
         self, url: str, payload: Dict[str, Any], timeout: Optional[int] = 60
@@ -1449,6 +1467,143 @@ class D365FieldCreator:
         rows = resp.json().get("value", [])
         names = sorted({str(r.get("Name", "")).strip() for r in rows if r.get("Name")})
         return names
+
+    def list_global_option_sets_by_solution(
+        self,
+        solution_unique_name: str,
+        progress_callback: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """查询指定解决方案下的全局下拉选项集。"""
+        sn = solution_unique_name.strip().replace("'", "''")
+        if not sn:
+            return []
+
+        def report(message: str) -> None:
+            if progress_callback:
+                progress_callback(message)
+
+        report(f"正在查找解决方案 {solution_unique_name}...")
+        sol_url = (
+            f"{self.api_base}/solutions?$select=solutionid,uniquename,friendlyname&"
+            f"$filter=uniquename eq '{sn}'"
+        )
+        resp = self._api_get(sol_url, timeout=90)
+        sol_rows = resp.json().get("value", [])
+        if not sol_rows:
+            raise RuntimeError(f"未找到解决方案: {solution_unique_name}")
+        solution_id = str(sol_rows[0].get("solutionid", "")).strip("{}")
+
+        report("正在读取解决方案中的全局下拉组件...")
+        option_set_ids: List[str] = []
+        url: Optional[str] = (
+            f"{self.api_base}/solutioncomponents?"
+            f"$select=objectid,componenttype&"
+            f"$filter=_solutionid_value eq {solution_id} and componenttype eq 9"
+        )
+        while url:
+            resp = self._api_get(url, timeout=120)
+            body = resp.json()
+            for row in body.get("value", []):
+                oid = row.get("objectid")
+                if oid:
+                    option_set_ids.append(str(oid).strip("{}").lower())
+            url = body.get("@odata.nextLink")
+        option_set_id_set = {x for x in option_set_ids if x}
+        if not option_set_id_set:
+            return []
+
+        report(f"正在批量读取全局下拉定义，解决方案中共有 {len(option_set_id_set)} 个...")
+        definitions_by_id: Dict[str, Dict[str, Any]] = {}
+        url = f"{self.api_base}/GlobalOptionSetDefinitions?$select=MetadataId,Name,DisplayName"
+        page_count = 0
+        while url:
+            resp = self._api_get(url, timeout=180)
+            body = resp.json()
+            page_count += 1
+            for row in body.get("value", []):
+                metadata_id = str(row.get("MetadataId", "") or "").strip("{}").lower()
+                if metadata_id and metadata_id in option_set_id_set:
+                    definitions_by_id[metadata_id] = row
+            report(f"已扫描全局下拉定义 {page_count} 页，已匹配 {len(definitions_by_id)}/{len(option_set_id_set)} 个...")
+            if len(definitions_by_id) >= len(option_set_id_set):
+                break
+            url = body.get("@odata.nextLink")
+
+        results: List[Dict[str, Any]] = []
+        for option_set_id in sorted(option_set_id_set):
+            body = definitions_by_id.get(option_set_id)
+            if not body:
+                continue
+            name = str(body.get("Name", "") or "").strip()
+            if not name:
+                continue
+            display_name_zh, display_name_en = _parse_display_name_labels(body.get("DisplayName"))
+            if not display_name_en:
+                display_name_en = _format_localized_label(body.get("DisplayName"))
+            if display_name_zh == display_name_en and not _has_chinese_char(display_name_zh):
+                display_name_zh = ""
+            results.append(
+                {
+                    "metadata_id": option_set_id,
+                    "name": name,
+                    "display_name_zh": display_name_zh,
+                    "display_name_en": display_name_en,
+                    "display_name": _join_display_names(display_name_zh, display_name_en) or name,
+                }
+            )
+        results.sort(key=lambda x: str(x.get("display_name_zh") or x.get("display_name_en") or x.get("name", "")).lower())
+        return results
+
+    def get_global_option_set_details(
+        self, option_set_name: str, metadata_id: str = ""
+    ) -> List[Dict[str, Any]]:
+        """获取指定全局下拉的选项值。优先按 MetadataId 查，失败后按 Name 查。"""
+        name = option_set_name.strip().replace("'", "''")
+        mid = (metadata_id or "").strip().replace("{", "").replace("}", "")
+        if not name and not mid:
+            return []
+        urls: List[str] = []
+        if mid:
+            urls.append(f"{self.api_base}/GlobalOptionSetDefinitions(MetadataId={mid})")
+        if name:
+            urls.append(f"{self.api_base}/GlobalOptionSetDefinitions(Name='{name}')")
+
+        resp: Optional[requests.Response] = None
+        for url in urls:
+            try:
+                resp = self._api_get(url, timeout=90)
+            except Exception:
+                resp = None
+                continue
+            break
+        if resp is None or resp.status_code >= 400:
+            status = resp.status_code if resp is not None else ""
+            body_text = resp.text if resp is not None else ""
+            raise RuntimeError(f"加载全局下拉失败: {status}, {body_text}")
+
+        body = resp.json()
+        results: List[Dict[str, Any]] = []
+        for opt in body.get("Options") or []:
+            value = opt.get("Value")
+            if value is None:
+                continue
+            label_zh, label_en = _parse_display_name_labels(opt.get("Label"))
+            if not label_en:
+                label_en = _format_localized_label(opt.get("Label"))
+            if label_zh == label_en and not _has_chinese_char(label_zh):
+                label_zh = ""
+            label = _join_display_names(label_zh, label_en) or str(value)
+            results.append(
+                {
+                    "value": value,
+                    "label_zh": label_zh,
+                    "label_en": label_en,
+                    "label": label,
+                    "description": "",
+                }
+            )
+        results.sort(key=lambda x: int(x.get("value") or 0))
+        return results
 
     def _exists(self, entity_name: str, logical_name: str) -> bool:
         url = (
@@ -2478,6 +2633,7 @@ class FieldCreatorGUI:
             ("field", "字段创建", self._build_field_panel),
             ("field_changes", "字段变更记录", self._build_field_changes_panel),
             ("local_table_store", "本地表存储", self._build_local_table_store_panel),
+            ("global_option_set", "全局下拉值", self._build_global_option_set_panel),
             ("translation", "实体翻译", self._build_translation_panel),
             ("translation_records", "实体翻译记录", self._build_translation_records_panel),
             ("table_query", "数据表查询", self._build_table_query_panel),
@@ -2496,6 +2652,7 @@ class FieldCreatorGUI:
             ("field", "字段创建", "field_group", "field"),
             ("table_query", "数据表查询", "field_group", "table_query"),
             ("local_table_store", "本地表存储", "field_group", "local_table_store"),
+            ("global_option_set", "全局下拉值", "field_group", "global_option_set"),
             ("translation_group", "翻译管理", "", None),
             ("translation", "实体翻译", "translation_group", "translation"),
             ("translation_records", "实体翻译记录", "translation_group", "translation_records"),
@@ -2709,6 +2866,707 @@ class FieldCreatorGUI:
         ttk.Button(button_bar, text="导出CS模板", command=self._export_cs_template).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(button_bar, text="从CS导入字段", command=self._import_fields_from_cs).grid(row=0, column=2)
 
+    def _build_global_option_set_panel(self, parent: ttk.Frame) -> None:
+        environments = load_environments(self._get_config_path())
+        self.global_option_env_map: Dict[str, Dict[str, str]] = {}
+        env_names: List[str] = []
+        for env in environments:
+            name = str(env.get("name", "")).strip()
+            if name and name not in self.global_option_env_map:
+                self.global_option_env_map[name] = env
+                env_names.append(name)
+        cfg = load_config(self._get_config_path())
+        default_env_name = str(cfg.get("environment_name", "")).strip()
+        if default_env_name not in self.global_option_env_map and env_names:
+            default_env_name = env_names[0]
+
+        parent.rowconfigure(2, weight=1)
+        parent.rowconfigure(5, weight=0)
+        parent.columnconfigure(0, weight=1)
+
+        toolbar = ttk.Frame(parent, padding=(8, 8, 8, 4))
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.columnconfigure(3, weight=1)
+
+        ttk.Label(toolbar, text="全局下拉值", font=("", 11, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Button(toolbar, text="刷新本地列表", command=self._refresh_global_option_local_panel).grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(toolbar, text="解决方案唯一名").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.vars["global_option_set_solution"] = tk.StringVar(value="McsOptionSet")
+        ttk.Entry(toolbar, textvariable=self.vars["global_option_set_solution"], width=32).grid(row=0, column=3, sticky="ew", padx=(0, 8))
+        ttk.Button(toolbar, text="筛选", command=self._apply_global_option_set_filter).grid(row=0, column=4, padx=(0, 8))
+        self.global_option_set_load_button = ttk.Button(toolbar, text="查询CRM全局下拉", command=self._on_load_global_option_sets)
+        self.global_option_set_load_button.grid(row=0, column=5, padx=(0, 8))
+        self.global_option_update_selected_button = ttk.Button(toolbar, text="更新选中下拉", command=self._refresh_selected_global_option_from_crm)
+        self.global_option_update_selected_button.grid(row=0, column=6, padx=(0, 8))
+
+        self.global_option_auto_refresh_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            toolbar,
+            text="自动刷新(30秒)",
+            variable=self.global_option_auto_refresh_var,
+            command=self._on_global_option_auto_refresh_toggle,
+        ).grid(row=0, column=7, sticky="w")
+
+        ttk.Label(toolbar, text="目标环境").grid(row=1, column=0, sticky="w", pady=(6, 0), padx=(0, 6))
+        self.global_option_env_var = tk.StringVar(value=default_env_name)
+        ttk.Combobox(
+            toolbar,
+            textvariable=self.global_option_env_var,
+            state="readonly",
+            values=env_names,
+            width=16,
+        ).grid(row=1, column=1, sticky="w", pady=(6, 0), padx=(0, 8))
+        ttk.Label(toolbar, text="下拉值搜索").grid(row=1, column=2, sticky="w", pady=(6, 0), padx=(0, 6))
+        self.global_option_set_keyword_var = tk.StringVar()
+        keyword_entry = ttk.Entry(toolbar, textvariable=self.global_option_set_keyword_var)
+        keyword_entry.grid(row=1, column=3, columnspan=3, sticky="ew", pady=(6, 0), padx=(0, 8))
+        keyword_entry.bind("<KeyRelease>", lambda _e: self._apply_global_option_set_filter())
+        self.global_option_progress_var = tk.DoubleVar(value=0)
+        self.global_option_progress = ttk.Progressbar(toolbar, maximum=100, variable=self.global_option_progress_var)
+        self.global_option_progress.grid(row=2, column=0, columnspan=6, sticky="ew", pady=(6, 0), padx=(0, 8))
+        self.global_option_progress_percent_var = tk.StringVar(value="0%")
+        ttk.Label(toolbar, textvariable=self.global_option_progress_percent_var, width=7).grid(row=2, column=6, sticky="w", pady=(6, 0))
+
+        self.global_option_set_status = tk.StringVar(value="页面显示本地已保存的全局下拉；查询 CRM 后可选择并批量保存到本地。")
+        ttk.Label(parent, textvariable=self.global_option_set_status, foreground="#666").grid(
+            row=1, column=0, sticky="w", padx=8, pady=(0, 4)
+        )
+
+        crm_frame = ttk.LabelFrame(parent, text="CRM 全局下拉", padding=4)
+        crm_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 6))
+        crm_frame.rowconfigure(0, weight=1)
+        crm_frame.columnconfigure(0, weight=1)
+        self.global_option_set_tree = ttk.Treeview(
+            crm_frame,
+            show="headings",
+            selectmode="browse",
+            height=8,
+            columns=("name", "display_name_zh", "display_name_en"),
+        )
+        for column, title, width in (
+            ("name", "名称", 260),
+            ("display_name_zh", "显示名称(中文)", 260),
+            ("display_name_en", "显示名称(英文)", 320),
+        ):
+            self.global_option_set_tree.heading(column, text=title)
+            self.global_option_set_tree.column(column, width=width, anchor="w", stretch=True)
+        self.global_option_set_tree.grid(row=0, column=0, sticky="nsew")
+        self.global_option_set_tree.bind("<<TreeviewSelect>>", self._on_global_option_set_select)
+        crm_y = ttk.Scrollbar(crm_frame, orient="vertical", command=self.global_option_set_tree.yview)
+        crm_y.grid(row=0, column=1, sticky="ns")
+        self.global_option_set_tree.configure(yscrollcommand=crm_y.set)
+        self.global_option_crm_pager = PaginationBar(
+            crm_frame,
+            page_size_options=(100, 200, 500),
+            default_page_size=100,
+            on_change=self._render_global_option_crm_page,
+        )
+        self.global_option_crm_pager.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        crm_frame.grid_remove()
+
+
+        self.global_option_local_keyword_var = tk.StringVar()
+
+        bottom = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        bottom.grid(row=2, column=0, rowspan=4, sticky="nsew", padx=8, pady=(0, 8))
+
+        local_set_frame = ttk.LabelFrame(bottom, text="本地已保存全局下拉", padding=4)
+        bottom.add(local_set_frame, weight=1)
+        local_set_frame.rowconfigure(0, weight=1)
+        local_set_frame.columnconfigure(0, weight=1)
+        self.global_option_local_set_tree = ttk.Treeview(
+            local_set_frame,
+            show="headings",
+            selectmode="browse",
+            columns=("environment_name", "solution_name", "name", "display_name", "option_count", "last_refreshed_at"),
+        )
+        for column, title, width in (
+            ("environment_name", "环境", 90),
+            ("solution_name", "解决方案", 120),
+            ("name", "名称", 220),
+            ("display_name", "显示名", 260),
+            ("option_count", "选项数", 70),
+            ("last_refreshed_at", "最后刷新", 150),
+        ):
+            self.global_option_local_set_tree.heading(column, text=title)
+            self.global_option_local_set_tree.column(column, width=width, anchor="w", stretch=(column in {"name", "display_name"}))
+        self.global_option_local_set_tree.grid(row=0, column=0, sticky="nsew")
+        self.global_option_local_set_tree.bind("<<TreeviewSelect>>", self._on_global_option_local_set_selected)
+        local_set_y = ttk.Scrollbar(local_set_frame, orient="vertical", command=self.global_option_local_set_tree.yview)
+        local_set_y.grid(row=0, column=1, sticky="ns")
+        self.global_option_local_set_tree.configure(yscrollcommand=local_set_y.set)
+        self.global_option_local_pager = PaginationBar(
+            local_set_frame,
+            page_size_options=(100, 200, 500),
+            default_page_size=100,
+            on_change=self._render_global_option_local_page,
+        )
+        self.global_option_local_pager.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        local_value_frame = ttk.LabelFrame(bottom, text="本地选项值", padding=4)
+        bottom.add(local_value_frame, weight=1)
+        local_value_frame.rowconfigure(0, weight=1)
+        local_value_frame.columnconfigure(0, weight=1)
+        self.global_option_local_value_tree = ttk.Treeview(
+            local_value_frame,
+            show="headings",
+            selectmode="browse",
+            columns=("value", "label_zh", "label_en"),
+        )
+        for column, title, width in (
+            ("value", "值", 90),
+            ("label_zh", "标签(中文)", 260),
+            ("label_en", "标签(英文)", 320),
+        ):
+            self.global_option_local_value_tree.heading(column, text=title)
+            self.global_option_local_value_tree.column(column, width=width, anchor="w", stretch=(column != "value"))
+        self.global_option_local_value_tree.grid(row=0, column=0, sticky="nsew")
+        local_value_y = ttk.Scrollbar(local_value_frame, orient="vertical", command=self.global_option_local_value_tree.yview)
+        local_value_y.grid(row=0, column=1, sticky="ns")
+        self.global_option_local_value_tree.configure(yscrollcommand=local_value_y.set)
+
+        self.global_option_set_items: List[Dict[str, Any]] = []
+        self.global_option_filtered_items: List[Dict[str, Any]] = []
+        self.global_option_set_row_map: Dict[str, Dict[str, Any]] = {}
+        self.global_option_local_rows: List[Dict[str, Any]] = []
+        self.global_option_local_row_map: Dict[str, Dict[str, Any]] = {}
+        self.global_option_local_current_values: List[Dict[str, Any]] = []
+        self.global_option_set_loading = False
+        self.global_option_value_loading = False
+        self.global_option_auto_refresh_job: Optional[str] = None
+        self._refresh_global_option_local_panel()
+
+    def _get_global_option_environment(self) -> Dict[str, str]:
+        env_name = self.global_option_env_var.get().strip() if hasattr(self, "global_option_env_var") else ""
+        env = getattr(self, "global_option_env_map", {}).get(env_name)
+        if not env:
+            raise RuntimeError("请选择目标环境")
+        return env
+
+    def _set_global_option_progress(self, percent: float, message: str = "") -> None:
+        pct = max(0, min(100, int(percent)))
+        if hasattr(self, "global_option_progress_var"):
+            self.global_option_progress_var.set(pct)
+        if hasattr(self, "global_option_progress_percent_var"):
+            self.global_option_progress_percent_var.set(f"{pct}%")
+        if message and hasattr(self, "global_option_set_status"):
+            self.global_option_set_status.set(message)
+
+    def _apply_global_option_set_filter(self) -> None:
+        self._refresh_global_option_local_panel()
+
+    def _render_global_option_crm_page(self) -> None:
+        if not hasattr(self, "global_option_set_tree"):
+            return
+        rows = list(getattr(self, "global_option_filtered_items", []))
+        self.global_option_set_row_map = {}
+        self.global_option_set_tree.delete(*self.global_option_set_tree.get_children())
+        if hasattr(self, "global_option_crm_pager"):
+            self.global_option_crm_pager.set_total(len(rows))
+            page_size = self.global_option_crm_pager.page_size()
+            start = (max(1, self.global_option_crm_pager.page) - 1) * page_size
+            page_rows = rows[start : start + page_size]
+        else:
+            page_rows = rows
+        for index, item in enumerate(page_rows):
+            iid = str(item.get("metadata_id") or item.get("name") or index)
+            self.global_option_set_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(item.get("name", ""), item.get("display_name_zh", ""), item.get("display_name_en", "")),
+            )
+            self.global_option_set_row_map[iid] = item
+
+    def _refresh_global_option_local_panel(self) -> None:
+        if not hasattr(self, "global_option_local_set_tree") or not hasattr(self, "op_logger"):
+            return
+        keyword = self.global_option_set_keyword_var.get().strip() if hasattr(self, "global_option_set_keyword_var") else ""
+        current_key = ""
+        if hasattr(self, "global_option_local_set_tree"):
+            selection = self.global_option_local_set_tree.selection()
+            if selection:
+                old_row = self.global_option_local_row_map.get(selection[0], {})
+                current_key = "|".join(
+                    [
+                        str(old_row.get("org_url", "")),
+                        str(old_row.get("solution_name", "")),
+                        str(old_row.get("option_set_name", "")),
+                    ]
+                )
+        rows = self.op_logger.list_local_global_option_sets(keyword)
+        self.global_option_local_rows = rows
+        if hasattr(self, "global_option_local_pager"):
+            self.global_option_local_pager.page = 1
+        self._render_global_option_local_page()
+        target_iid = ""
+        if current_key:
+            for iid, row in self.global_option_local_row_map.items():
+                row_key = "|".join(
+                    [
+                        str(row.get("org_url", "")),
+                        str(row.get("solution_name", "")),
+                        str(row.get("option_set_name", "")),
+                    ]
+                )
+                if row_key == current_key:
+                    target_iid = iid
+                    break
+        if not target_iid and self.global_option_local_row_map:
+            target_iid = next(iter(self.global_option_local_row_map))
+        if target_iid:
+            self.global_option_local_set_tree.selection_set(target_iid)
+            self.global_option_local_set_tree.see(target_iid)
+            self._on_global_option_local_set_selected()
+        else:
+            self.global_option_local_current_values = []
+            self._populate_global_option_local_values([])
+            pass
+
+    def _render_global_option_local_page(self) -> None:
+        if not hasattr(self, "global_option_local_set_tree"):
+            return
+        rows = list(getattr(self, "global_option_local_rows", []))
+        self.global_option_local_row_map = {}
+        self.global_option_local_set_tree.delete(*self.global_option_local_set_tree.get_children())
+        if hasattr(self, "global_option_local_pager"):
+            self.global_option_local_pager.set_total(len(rows))
+            page_size = self.global_option_local_pager.page_size()
+            start = (max(1, self.global_option_local_pager.page) - 1) * page_size
+            page_rows = rows[start : start + page_size]
+        else:
+            page_rows = rows
+        for row in page_rows:
+            item_id = str(row.get("id"))
+            display = _join_display_names(
+                str(row.get("option_set_display_name_zh") or ""),
+                str(row.get("option_set_display_name_en") or ""),
+            )
+            self.global_option_local_set_tree.insert(
+                "",
+                "end",
+                iid=item_id,
+                values=(
+                    row.get("environment_name", ""),
+                    row.get("solution_name", ""),
+                    row.get("option_set_name", ""),
+                    display,
+                    row.get("option_count", 0),
+                    self._format_log_time(str(row.get("last_refreshed_at", ""))),
+                ),
+            )
+            self.global_option_local_row_map[item_id] = row
+
+    def _on_global_option_local_set_selected(self, _event: Any = None) -> None:
+        selection = self.global_option_local_set_tree.selection()
+        if not selection:
+            return
+        row = self.global_option_local_row_map.get(selection[0])
+        if not row:
+            return
+        values = self.op_logger.list_local_global_option_set_values(
+            org_url=str(row.get("org_url", "")),
+            solution_name=str(row.get("solution_name", "")),
+            option_set_name=str(row.get("option_set_name", "")),
+        )
+        self.global_option_local_current_values = values
+        self._apply_global_option_local_value_filter()
+
+
+    def _apply_global_option_local_value_filter(self) -> None:
+        keyword = self.global_option_local_keyword_var.get().strip().lower() if hasattr(self, "global_option_local_keyword_var") else ""
+        rows = list(getattr(self, "global_option_local_current_values", []))
+        if keyword:
+            rows = [
+                row
+                for row in rows
+                if keyword in str(row.get("option_value", "")).lower()
+                or keyword in str(row.get("label_zh", "")).lower()
+                or keyword in str(row.get("label_en", "")).lower()
+            ]
+        self._populate_global_option_local_values(rows)
+
+    def _populate_global_option_local_values(self, rows: List[Dict[str, Any]]) -> None:
+        if not hasattr(self, "global_option_local_value_tree"):
+            return
+        tree = self.global_option_local_value_tree
+        tree.delete(*tree.get_children())
+        for row in rows:
+            tree.insert("", "end", values=(row.get("option_value", ""), row.get("label_zh", ""), row.get("label_en", "")))
+
+    def _on_load_global_option_sets(self) -> None:
+        if getattr(self, "global_option_set_loading", False):
+            return
+        solution_name = self.vars.get("global_option_set_solution", tk.StringVar()).get().strip()
+        if not solution_name:
+            messagebox.showwarning("提示", "请先输入解决方案唯一名。", parent=self.root)
+            return
+        try:
+            env = self._get_global_option_environment()
+        except Exception as exc:
+            messagebox.showwarning("提示", str(exc), parent=self.root)
+            return
+
+        self.global_option_set_loading = True
+        self._set_global_option_progress(0, f"正在加载 {solution_name} 下的 CRM 全局下拉...")
+        if hasattr(self, "global_option_set_load_button"):
+            self.global_option_set_load_button.configure(state="disabled")
+
+        def set_status(message: str) -> None:
+            self.root.after(0, lambda m=message: self.global_option_set_status.set(m))
+
+        def worker() -> None:
+            try:
+                creator = self._create_creator_for_environment(env)
+                items = creator.list_global_option_sets_by_solution(solution_name, progress_callback=set_status)
+
+                def on_done() -> None:
+                    self.global_option_set_loading = False
+                    if hasattr(self, "global_option_set_load_button"):
+                        self.global_option_set_load_button.configure(state="normal")
+                    self.global_option_set_items = items
+                    self.global_option_filtered_items = items
+                    self._render_global_option_crm_page()
+                    self._set_global_option_progress(100, f"已加载 {solution_name} 下的 CRM 全局下拉 {len(items)} 个，请选择要保存到本地的下拉。")
+                    self._log_op("global_option_set", "load", "success", f"已加载 CRM 全局下拉 {len(items)} 个", solution_name=solution_name)
+                    self._open_global_option_import_dialog(env, solution_name, items)
+
+                self.root.after(0, on_done)
+            except Exception as exc:
+                msg = _format_exception(exc)
+
+                def on_error() -> None:
+                    self.global_option_set_loading = False
+                    if hasattr(self, "global_option_set_load_button"):
+                        self.global_option_set_load_button.configure(state="normal")
+                    self._set_global_option_progress(0, f"加载失败: {msg}")
+                    self._log_op("global_option_set", "load", "failed", "加载 CRM 全局下拉失败", error_message=msg, solution_name=solution_name)
+                    messagebox.showerror("错误", msg, parent=self.root)
+
+                self.root.after(0, on_error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_global_option_import_dialog(
+        self,
+        env: Dict[str, str],
+        solution_name: str,
+        rows: List[Dict[str, Any]],
+    ) -> None:
+        saved_names = {
+            str(row.get("option_set_name", "")).strip().lower()
+            for row in self.op_logger.list_local_global_option_sets("")
+            if str(row.get("org_url", "")).strip().rstrip("/").lower() == str(env.get("org_url", "")).strip().rstrip("/").lower()
+            and str(row.get("solution_name", "")).strip().lower() == str(solution_name).strip().lower()
+        }
+        rows = [row for row in rows if str(row.get("name", "")).strip().lower() not in saved_names]
+        if not rows:
+            messagebox.showinfo("提示", "查询到的全局下拉都已经保存到本地。", parent=self.root)
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("保存全局下拉值到本地")
+        dialog.geometry("980x620")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(2, weight=1)
+
+        status_var = tk.StringVar(value=f"共 {len(rows)} 个全局下拉。请选择要保存到本地的记录，支持 Ctrl/Shift 多选。")
+        ttk.Label(dialog, textvariable=status_var, foreground="#666").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+
+        filter_frame = ttk.Frame(dialog, padding=(8, 0, 8, 4))
+        filter_frame.grid(row=1, column=0, sticky="ew")
+        filter_frame.columnconfigure(1, weight=1)
+        ttk.Label(filter_frame, text="下拉搜索").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        keyword_var = tk.StringVar()
+        keyword_entry = ttk.Entry(filter_frame, textvariable=keyword_var)
+        keyword_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+
+        tree_frame = ttk.Frame(dialog, padding=(8, 0, 8, 4))
+        tree_frame.grid(row=2, column=0, sticky="nsew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        tree = ttk.Treeview(
+            tree_frame,
+            show="headings",
+            selectmode="extended",
+            columns=("name", "display_name_zh", "display_name_en"),
+        )
+        for column, title, width in (
+            ("name", "名称", 260),
+            ("display_name_zh", "显示名称(中文)", 260),
+            ("display_name_en", "显示名称(英文)", 320),
+        ):
+            tree.heading(column, text=title)
+            tree.column(column, width=width, anchor="w", stretch=True)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ybar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        ybar.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=ybar.set)
+
+        button_frame = ttk.Frame(dialog, padding=(8, 4, 8, 8))
+        button_frame.grid(row=3, column=0, sticky="ew")
+        button_frame.columnconfigure(0, weight=1)
+        button_frame.columnconfigure(1, weight=1)
+        button_frame.columnconfigure(2, weight=1)
+
+        row_map: Dict[str, Dict[str, Any]] = {}
+
+        def render() -> None:
+            keyword = keyword_var.get().strip().lower()
+            tree.delete(*tree.get_children())
+            row_map.clear()
+            visible_count = 0
+            for index, row in enumerate(rows):
+                haystack = " ".join(
+                    [
+                        str(row.get("name", "")),
+                        str(row.get("display_name_zh", "")),
+                        str(row.get("display_name_en", "")),
+                        str(row.get("display_name", "")),
+                    ]
+                ).lower()
+                if keyword and keyword not in haystack:
+                    continue
+                visible_count += 1
+                iid = str(row.get("metadata_id") or row.get("name") or index)
+                tree.insert(
+                    "",
+                    "end",
+                    iid=iid,
+                    values=(row.get("name", ""), row.get("display_name_zh", ""), row.get("display_name_en", "")),
+                )
+                row_map[iid] = row
+            status_var.set(f"共 {len(rows)} 个全局下拉，当前显示 {visible_count} 个。请选择后保存到本地。")
+
+        def select_all_visible() -> None:
+            tree.selection_set(tree.get_children())
+
+        def confirm() -> None:
+            selected = [row_map[item] for item in tree.selection() if item in row_map]
+            if not selected:
+                messagebox.showwarning("提示", "请先选择要保存的全局下拉。", parent=dialog)
+                return
+            dialog.destroy()
+            self._save_global_option_sets_to_local(env, solution_name, selected)
+
+        ttk.Button(button_frame, text="全选当前列表", command=select_all_visible).grid(row=0, column=0, sticky="w")
+        ttk.Button(button_frame, text="确认保存到本地", command=confirm).grid(row=0, column=1)
+        ttk.Button(button_frame, text="关闭", command=dialog.destroy).grid(row=0, column=2, sticky="e")
+
+        keyword_entry.bind("<KeyRelease>", lambda _e: render())
+        render()
+
+    def _save_global_option_sets_to_local(
+        self,
+        env: Dict[str, str],
+        solution_name: str,
+        rows: List[Dict[str, Any]],
+    ) -> None:
+        if getattr(self, "global_option_value_loading", False):
+            return
+        self.global_option_value_loading = True
+        if hasattr(self, "global_option_update_selected_button"):
+            self.global_option_update_selected_button.configure(state="disabled")
+        total = len(rows)
+        env_name = str(env.get("name", ""))
+        env_url = str(env.get("org_url", ""))
+        self._set_global_option_progress(0, f"准备保存 {total} 个全局下拉到本地...")
+
+        def worker() -> None:
+            saved = 0
+            failed: List[str] = []
+            try:
+                creator = self._create_creator_for_environment(env)
+                for index, row in enumerate(rows, start=1):
+                    option_set_name = str(row.get("name", "") or "").strip()
+                    metadata_id = str(row.get("metadata_id", "") or "")
+                    self.root.after(
+                        0,
+                        lambda i=index, name=option_set_name: self._set_global_option_progress(
+                            (i - 1) * 100 / max(1, total), f"正在保存 {i}/{total}: {name}"
+                        ),
+                    )
+                    try:
+                        options = creator.get_global_option_set_details(option_set_name, metadata_id)
+                        self.op_logger.replace_local_global_option_values(
+                            environment_name=env_name,
+                            org_url=env_url,
+                            solution_name=solution_name,
+                            option_set=row,
+                            options=options,
+                        )
+                        saved += 1
+                    except Exception as exc:
+                        failed.append(f"{option_set_name}: {_format_exception(exc)}")
+                    self.root.after(
+                        0,
+                        lambda i=index, name=option_set_name: self._set_global_option_progress(
+                            i * 100 / max(1, total), f"已处理 {i}/{total}: {name}"
+                        ),
+                    )
+
+                def on_done() -> None:
+                    self.global_option_value_loading = False
+                    if hasattr(self, "global_option_update_selected_button"):
+                        self.global_option_update_selected_button.configure(state="normal")
+                    self._refresh_global_option_local_panel()
+                    msg = f"保存完成：成功 {saved} 个，失败 {len(failed)} 个。"
+                    if failed:
+                        msg += " " + "；".join(failed[:3])
+                    self._set_global_option_progress(100, msg)
+                    self._append_log(msg)
+                    self._log_op(
+                        "global_option_set",
+                        "bulk_save_values",
+                        "success" if not failed else "failed",
+                        msg,
+                        details={"total": total, "success": saved, "failed": len(failed), "failed_preview": failed[:50]},
+                        target_org_url=env_url,
+                        environment_name=env_name,
+                        solution_name=solution_name,
+                    )
+
+                self.root.after(0, on_done)
+            except Exception as exc:
+                msg = _format_exception(exc)
+
+                def on_error() -> None:
+                    self.global_option_value_loading = False
+                    if hasattr(self, "global_option_update_selected_button"):
+                        self.global_option_update_selected_button.configure(state="normal")
+                    self._set_global_option_progress(0, f"保存失败: {msg}")
+                    messagebox.showerror("错误", msg, parent=self.root)
+
+                self.root.after(0, on_error)
+
+        threading.Thread(target=worker, daemon=True).start()
+    def _on_global_option_set_select(self, _event: Any) -> None:
+        self._refresh_selected_global_option_from_crm()
+
+    def _refresh_selected_global_option_from_crm(self) -> None:
+        if getattr(self, "global_option_value_loading", False):
+            return
+        selection = self.global_option_local_set_tree.selection() if hasattr(self, "global_option_local_set_tree") else ()
+        if not selection:
+            messagebox.showwarning("提示", "请先选择一个本地已保存的全局下拉。", parent=self.root)
+            return
+        local_row = self.global_option_local_row_map.get(selection[0])
+        if not local_row:
+            return
+        solution_name = str(local_row.get("solution_name", "") or self.vars.get("global_option_set_solution", tk.StringVar()).get()).strip()
+        option_set_name = str(local_row.get("option_set_name", "") or "").strip()
+        metadata_id = str(local_row.get("option_set_metadata_id", "") or "")
+        item = {
+            "name": option_set_name,
+            "metadata_id": metadata_id,
+            "display_name_zh": str(local_row.get("option_set_display_name_zh", "") or ""),
+            "display_name_en": str(local_row.get("option_set_display_name_en", "") or ""),
+        }
+        try:
+            env = self._get_global_option_environment()
+        except Exception as exc:
+            messagebox.showwarning("提示", str(exc), parent=self.root)
+            return
+        self.global_option_value_loading = True
+        self._set_global_option_progress(0, f"正在更新 {option_set_name} 的选项值...")
+        if hasattr(self, "global_option_update_selected_button"):
+            self.global_option_update_selected_button.configure(state="disabled")
+
+        def worker() -> None:
+            try:
+                creator = self._create_creator_for_environment(env)
+                options = creator.get_global_option_set_details(option_set_name, metadata_id)
+                self.op_logger.replace_local_global_option_values(
+                    environment_name=str(env.get("name", "")),
+                    org_url=str(env.get("org_url", "")),
+                    solution_name=solution_name,
+                    option_set=item,
+                    options=options,
+                )
+
+                def on_done() -> None:
+                    self.global_option_value_loading = False
+                    if hasattr(self, "global_option_update_selected_button"):
+                        self.global_option_update_selected_button.configure(state="normal")
+                    self._refresh_global_option_local_panel()
+                    for iid, row in self.global_option_local_row_map.items():
+                        if str(row.get("option_set_name", "")) == option_set_name:
+                            self.global_option_local_set_tree.selection_set(iid)
+                            self.global_option_local_set_tree.see(iid)
+                            self._on_global_option_local_set_selected()
+                            break
+                    self._set_global_option_progress(100, f"{option_set_name}: 共 {len(options)} 个选项值，已保存到本地表。")
+                    self._log_op(
+                        "global_option_set",
+                        "refresh_saved_values",
+                        "success",
+                        f"更新本地全局下拉 {option_set_name} 选项值 {len(options)} 个",
+                        details={
+                            "environment_name": str(env.get("name", "")),
+                            "org_url": str(env.get("org_url", "")),
+                            "solution_name": solution_name,
+                            "option_set": item,
+                            "option_count": len(options),
+                            "options_preview": options[:20],
+                        },
+                        target_org_url=str(env.get("org_url", "")),
+                        environment_name=str(env.get("name", "")),
+                        solution_name=solution_name,
+                    )
+
+                self.root.after(0, on_done)
+            except Exception as exc:
+                msg = _format_exception(exc)
+
+                def on_error() -> None:
+                    self.global_option_value_loading = False
+                    if hasattr(self, "global_option_update_selected_button"):
+                        self.global_option_update_selected_button.configure(state="normal")
+                    self._set_global_option_progress(0, f"更新失败: {msg}")
+                    self._log_op(
+                        "global_option_set",
+                        "refresh_saved_values",
+                        "failed",
+                        f"更新本地全局下拉 {option_set_name} 失败",
+                        details={"solution_name": solution_name, "option_set": item},
+                        error_message=msg,
+                        solution_name=solution_name,
+                    )
+                    messagebox.showerror("错误", msg, parent=self.root)
+
+                self.root.after(0, on_error)
+
+        threading.Thread(target=worker, daemon=True).start()
+    def _on_global_option_auto_refresh_toggle(self) -> None:
+        if self.global_option_auto_refresh_var.get():
+            self._schedule_global_option_auto_refresh()
+        else:
+            self._cancel_global_option_auto_refresh()
+
+    def _schedule_global_option_auto_refresh(self) -> None:
+        self._cancel_global_option_auto_refresh()
+        if not hasattr(self, "global_option_auto_refresh_var") or not self.global_option_auto_refresh_var.get():
+            return
+        if not hasattr(self, "root") or not self.root.winfo_exists():
+            return
+        self.global_option_auto_refresh_job = self.root.after(30000, self._global_option_auto_refresh_tick)
+
+    def _cancel_global_option_auto_refresh(self) -> None:
+        job = getattr(self, "global_option_auto_refresh_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self.global_option_auto_refresh_job = None
+
+    def _global_option_auto_refresh_tick(self) -> None:
+        self.global_option_auto_refresh_job = None
+        if self._active_panel == "global_option_set" and self.global_option_auto_refresh_var.get():
+            self._refresh_global_option_local_panel()
+            self._schedule_global_option_auto_refresh()
     def _load_defaults(self) -> None:
         self.vars["config_path"].set(self.default_config_path)
         cfg = load_config(self.default_config_path)
@@ -3517,7 +4375,7 @@ namespace D365ModelTemplate
             default_env_name = local_env_names[0]
 
         parent.rowconfigure(2, weight=1)
-        parent.rowconfigure(5, weight=2)
+        parent.rowconfigure(5, weight=0)
         parent.columnconfigure(0, weight=1)
 
         toolbar = ttk.Frame(parent, padding=(8, 8, 8, 4))
@@ -5508,6 +6366,52 @@ namespace D365ModelTemplate
         ttk.Button(btn_col, text="上移", command=lambda: move_selected(-1)).pack(fill="x", pady=2)
         ttk.Button(btn_col, text="下移", command=lambda: move_selected(1)).pack(fill="x", pady=2)
 
+        preset_frame = ttk.LabelFrame(btn_col, text="常用解决方案", padding=4)
+        preset_frame.pack(fill="x", pady=(10, 2))
+        preset_solution_names = [
+            "McsOptionSet",
+            "McsWebResource",
+            "McsRole",
+            "McsCustomAPI",
+            "McsPlugin",
+            "McsAutomate",
+            "app_allcomponents",
+        ]
+        self.deploy_preset_solution_vars: Dict[str, tk.BooleanVar] = {}
+
+        def remove_solution_name(name: str) -> None:
+            unique = name.strip()
+            if not unique:
+                return
+            if unique not in self.deploy_solution_names:
+                return
+            self.deploy_solution_names = [item for item in self.deploy_solution_names if item != unique]
+            self._deploy_refresh_listbox()
+            self._log_op(
+                "deploy",
+                "remove_preset_solution",
+                "success",
+                f"已从发版列表移除预设解决方案: {unique}",
+                details={"solution_name": unique, "list_size": len(self.deploy_solution_names)},
+                solution_name=unique,
+            )
+
+        def on_preset_solution_toggle(name: str) -> None:
+            var = self.deploy_preset_solution_vars.get(name)
+            if var is not None and var.get():
+                add_solution_name(name)
+            else:
+                remove_solution_name(name)
+
+        for preset_name in preset_solution_names:
+            preset_var = tk.BooleanVar(value=False)
+            self.deploy_preset_solution_vars[preset_name] = preset_var
+            ttk.Checkbutton(
+                preset_frame,
+                text=preset_name,
+                variable=preset_var,
+                command=lambda name=preset_name: on_preset_solution_toggle(name),
+            ).pack(anchor="w", pady=1)
         search_frame = ttk.Frame(solutions_frame)
         search_frame.grid(row=5, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 6))
         search_frame.columnconfigure(1, weight=1)
@@ -5888,6 +6792,7 @@ namespace D365ModelTemplate
         keyword_entry = ttk.Entry(toolbar, textvariable=self.translation_record_keyword_var)
         keyword_entry.grid(row=0, column=3, sticky="ew", padx=(0, 8))
         keyword_entry.bind("<Return>", lambda _event: self._refresh_translation_records_panel())
+        keyword_entry.bind("<KeyRelease>", lambda _event: self._refresh_translation_records_panel())
 
         ttk.Label(toolbar, text="条数").grid(row=0, column=4, sticky="w", padx=(0, 4))
         self.translation_record_limit_var = tk.StringVar(value="300")
@@ -6015,24 +6920,22 @@ namespace D365ModelTemplate
         text = (iso_text or "").strip()
         if not text:
             return ""
+        china_tz = timezone(timedelta(hours=8))
         try:
             if text.endswith("Z"):
                 text = text[:-1] + "+00:00"
             dt = datetime.fromisoformat(text)
-            if dt.tzinfo is not None:
-                dt = dt.astimezone(timezone.utc)
-            else:
+            if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            dt = dt + timedelta(hours=8)
+            dt = dt.astimezone(china_tz)
             return dt.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             raw = iso_text[:19].replace("T", " ")
             try:
-                dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S") + timedelta(hours=8)
+                dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
                 return dt.strftime("%Y-%m-%d %H:%M:%S")
             except ValueError:
                 return raw
-
     def _format_log_detail(self, row: Dict[str, Any]) -> str:
         lines = [
             f"编号: {row.get('id', '')}",
@@ -6228,6 +7131,7 @@ namespace D365ModelTemplate
         keyword_entry = ttk.Entry(toolbar, textvariable=self.log_filter_keyword)
         keyword_entry.grid(row=0, column=7, sticky="ew", padx=(0, 8))
         keyword_entry.bind("<Return>", lambda _e: self._refresh_logs_panel())
+        keyword_entry.bind("<KeyRelease>", lambda _e: self._refresh_logs_panel())
 
         ttk.Button(toolbar, text="刷新", command=self._refresh_logs_panel).grid(row=0, column=8, padx=(0, 8))
         ttk.Button(
