@@ -1341,6 +1341,28 @@ class D365FieldCreator:
             raise RuntimeError("导出解决方案失败：响应中无 ExportSolutionFile")
         return base64.b64decode(file_b64)
 
+    def export_solution_translations(self, solution_unique_name: str) -> bytes:
+        """Export a solution translation ZIP containing CrmTranslations.xml."""
+        # ExportTranslation is bound to the solution collection in the Web API.
+        url = f"{self.api_base}/solutions/Microsoft.Dynamics.CRM.ExportTranslation"
+        resp = self._api_post(url, {"SolutionName": solution_unique_name}, timeout=None)
+        file_b64 = resp.json().get("ExportTranslationFile", "")
+        if not file_b64:
+            raise RuntimeError("Export solution translations failed: ExportTranslationFile is missing")
+        return base64.b64decode(file_b64)
+
+    def import_solution_translations(self, translation_zip: bytes) -> None:
+        """Import a solution translation ZIP produced by ExportTranslation."""
+        url = f"{self.api_base}/Microsoft.Dynamics.CRM.ImportTranslation"
+        self._api_post(
+            url,
+            {
+                "TranslationFile": base64.b64encode(translation_zip).decode("ascii"),
+                "ImportJobId": str(uuid.uuid4()),
+            },
+            timeout=None,
+        )
+
     def import_solution(
         self,
         solution_bytes: bytes,
@@ -2297,6 +2319,7 @@ class FieldCreatorGUI:
         self.searching_entities = False
         self.searching_solutions = False
         self.dynamic_widgets: Dict[str, List[tk.Widget]] = {"lookup": [], "picklist": [], "file": []}
+        self.field_rows: List[Dict[str, Any]] = []
         self._build_form()
         db_path = default_db_path(self.default_config_path)
         self.op_logger = OperationLogger(db_path)
@@ -2779,89 +2802,86 @@ class FieldCreatorGUI:
 
         ttk.Separator(top, orient="horizontal").grid(row=6, column=0, columnspan=2, sticky="ew", pady=8)
         ttk.Label(top, text="字段配置", font=("", 11, "bold")).grid(row=7, column=0, sticky="w", pady=(0, 6))
-        self._add_entry(top, 8, "字段逻辑名", "logical_name")
-        self._add_entry(top, 9, "字段架构名", "schema_name")
-        self._add_entry(top, 10, "显示名称", "display_name")
-        self._add_entry(top, 11, "描述", "description")
-        ttk.Label(top, text="字段类型").grid(row=12, column=0, sticky="w", padx=6, pady=4)
-        self.vars["field_type"] = tk.StringVar()
-        self.field_type_combo = ttk.Combobox(
-            top,
-            textvariable=self.vars["field_type"],
-            state="readonly",
-            values=list(FIELD_TYPE_LABEL_TO_VALUE.keys()),
+        ttk.Label(top, text="每一行代表一个字段；填写后点击“新增行”，可连续添加多个字段。", foreground="#666666").grid(
+            row=8, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6)
         )
-        self.field_type_combo.grid(row=12, column=1, sticky="ew", padx=6, pady=4)
-        self.field_type_combo.bind("<<ComboboxSelected>>", self._on_field_type_change)
-        ttk.Label(top, text="是否必填").grid(row=13, column=0, sticky="w", padx=6, pady=4)
-        self.vars["required_level"] = tk.StringVar()
-        self.required_level_combo = ttk.Combobox(
-            top, textvariable=self.vars["required_level"], state="readonly", values=list(REQUIRED_LEVEL_LABEL_TO_VALUE.keys())
-        )
-        self.required_level_combo.grid(row=13, column=1, sticky="ew", padx=6, pady=4)
-        self._add_entry(top, 14, "最大长度 (string/memo)", "max_length")
-        self.lookup_target_label = ttk.Label(top, text="查找目标实体 (lookup)")
-        self.lookup_target_label.grid(row=15, column=0, sticky="w", padx=6, pady=4)
-        self.vars["lookup_target_entity"] = tk.StringVar()
-        self.lookup_target_combo = ttk.Combobox(top, textvariable=self.vars["lookup_target_entity"])
-        self.lookup_target_combo.grid(row=15, column=1, sticky="ew", padx=6, pady=4)
-        self.lookup_rel_label, self.lookup_rel_entry = self._add_entry(
-            top, 16, "关系架构名 (lookup 可选)", "lookup_relationship_schema_name"
-        )
-        self.picklist_mode_label = ttk.Label(top, text="下拉模式 (local/global)")
-        self.picklist_mode_label.grid(row=17, column=0, sticky="w", padx=6, pady=4)
-        self.vars["picklist_mode"] = tk.StringVar()
-        self.picklist_mode_combo = ttk.Combobox(
-            top, textvariable=self.vars["picklist_mode"], state="readonly", values=["local", "global"]
-        )
-        self.picklist_mode_combo.grid(row=17, column=1, sticky="ew", padx=6, pady=4)
-        self.picklist_mode_combo.bind("<<ComboboxSelected>>", self._on_picklist_mode_change)
-        self.picklist_global_label = ttk.Label(top, text="全局选项集名称 (picklist)")
-        self.picklist_global_label.grid(row=18, column=0, sticky="w", padx=6, pady=4)
-        global_frame = ttk.Frame(top)
-        global_frame.grid(row=18, column=1, sticky="ew", padx=6, pady=4)
-        global_frame.columnconfigure(0, weight=1)
-        self.vars["picklist_global_name"] = tk.StringVar()
-        self.picklist_global_combo = ttk.Combobox(global_frame, textvariable=self.vars["picklist_global_name"])
-        self.picklist_global_combo.grid(row=0, column=0, sticky="ew")
-        self.picklist_global_combo.bind("<KeyRelease>", self._on_global_option_set_input)
-        ttk.Button(global_frame, text="加载全局下拉", command=self._load_global_option_sets).grid(
-            row=0, column=1, padx=(8, 0)
-        )
-        self.picklist_default_label, self.picklist_default_entry = self._add_entry(
-            top, 19, "默认值 (picklist，可选)", "picklist_default_value"
-        )
-        self.picklist_options_label = ttk.Label(top, text="本地下拉选项 (picklist，本地模式，每行: 值:标签)")
-        self.picklist_options_label.grid(row=20, column=0, sticky="nw", padx=6, pady=4)
-        self.picklist_options_text = tk.Text(top, height=5, wrap="word")
-        self.picklist_options_text.grid(row=20, column=1, sticky="ew", padx=6, pady=4)
-        self.file_size_label, self.file_size_entry = self._add_entry(
-            top, 21, "文件大小上限KB (file)", "file_max_size_kb"
-        )
+        editor = ttk.Frame(top)
+        editor.grid(row=9, column=0, columnspan=2, sticky="ew", padx=6)
+        for col in range(4):
+            editor.columnconfigure(col, weight=1)
+        self.field_row_vars = {key: tk.StringVar() for key in ("logical_name", "schema_name", "display_name", "description", "max_length")}
+        self.field_row_type_var = tk.StringVar(value=list(FIELD_TYPE_LABEL_TO_VALUE.keys())[0])
+        self.field_row_required_var = tk.StringVar(value=list(REQUIRED_LEVEL_LABEL_TO_VALUE.keys())[0])
+        row_controls = [("字段逻辑名", "logical_name"), ("字段架构名", "schema_name"), ("显示名称", "display_name"), ("描述", "description")]
+        for col, (label, key) in enumerate(row_controls):
+            ttk.Label(editor, text=label).grid(row=0, column=col, sticky="w", pady=(0, 2))
+            ttk.Entry(editor, textvariable=self.field_row_vars[key]).grid(row=1, column=col, sticky="ew", padx=(0, 6))
+        ttk.Label(editor, text="字段类型").grid(row=2, column=0, sticky="w", pady=(8, 2))
+        self.field_row_type_combo = ttk.Combobox(editor, textvariable=self.field_row_type_var, state="readonly", values=list(FIELD_TYPE_LABEL_TO_VALUE.keys()))
+        self.field_row_type_combo.grid(row=3, column=0, sticky="ew", padx=(0, 6))
+        self.field_row_type_combo.bind("<<ComboboxSelected>>", self._on_row_field_type_change)
+        ttk.Label(editor, text="是否必填").grid(row=2, column=1, sticky="w", pady=(8, 2))
+        ttk.Combobox(editor, textvariable=self.field_row_required_var, state="readonly", values=list(REQUIRED_LEVEL_LABEL_TO_VALUE.keys())).grid(row=3, column=1, sticky="ew", padx=(0, 6))
+        ttk.Label(editor, text="最大长度（文本/多行文本）").grid(row=2, column=2, sticky="w", pady=(8, 2))
+        ttk.Entry(editor, textvariable=self.field_row_vars["max_length"]).grid(row=3, column=2, sticky="ew", padx=(0, 6))
+        ttk.Button(editor, text="新增行", command=self._add_field_row).grid(row=3, column=3, sticky="ew")
 
-        self.dynamic_widgets["lookup"] = [
-            self.lookup_target_label,
-            self.lookup_target_combo,
-            self.lookup_rel_label,
-            self.lookup_rel_entry,
-        ]
-        self.dynamic_widgets["picklist"] = [
-            self.picklist_mode_label,
-            self.picklist_mode_combo,
-            self.picklist_global_label,
-            global_frame,
-            self.picklist_default_label,
-            self.picklist_default_entry,
-            self.picklist_options_label,
-            self.picklist_options_text,
-        ]
-        self.dynamic_widgets["file"] = [
-            self.file_size_label,
-            self.file_size_entry,
-        ]
+        self.field_row_advanced_frame = ttk.LabelFrame(editor, text="字段类型附加配置", padding=(6, 4))
+        self.field_row_advanced_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.field_row_advanced_frame.columnconfigure(1, weight=1)
+        self.field_row_lookup_frame = ttk.Frame(self.field_row_advanced_frame)
+        self.field_row_lookup_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.field_row_lookup_frame.columnconfigure(1, weight=1)
+        self.field_row_lookup_target_var = tk.StringVar()
+        self.field_row_lookup_relationship_var = tk.StringVar()
+        ttk.Label(self.field_row_lookup_frame, text="查找目标实体").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.field_row_lookup_target_combo = ttk.Combobox(self.field_row_lookup_frame, textvariable=self.field_row_lookup_target_var)
+        self.field_row_lookup_target_combo.grid(row=0, column=1, sticky="ew", padx=(0, 12))
+        ttk.Label(self.field_row_lookup_frame, text="关系架构名（可选）").grid(row=0, column=2, sticky="w", padx=(0, 8))
+        ttk.Entry(self.field_row_lookup_frame, textvariable=self.field_row_lookup_relationship_var, width=26).grid(row=0, column=3, sticky="ew")
 
+        self.field_row_picklist_frame = ttk.Frame(self.field_row_advanced_frame)
+        self.field_row_picklist_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.field_row_picklist_frame.columnconfigure(5, weight=1)
+        self.field_row_picklist_mode_var = tk.StringVar(value="local")
+        self.field_row_picklist_global_var = tk.StringVar()
+        self.field_row_picklist_default_var = tk.StringVar()
+        ttk.Label(self.field_row_picklist_frame, text="下拉模式").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.field_row_picklist_mode_combo = ttk.Combobox(self.field_row_picklist_frame, textvariable=self.field_row_picklist_mode_var, state="readonly", values=["local", "global"], width=10)
+        self.field_row_picklist_mode_combo.grid(row=0, column=1, sticky="w", padx=(0, 12))
+        self.field_row_picklist_mode_combo.bind("<<ComboboxSelected>>", self._on_row_picklist_mode_change)
+        ttk.Label(self.field_row_picklist_frame, text="全局选项集").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.field_row_picklist_global_combo = ttk.Combobox(self.field_row_picklist_frame, textvariable=self.field_row_picklist_global_var, width=24)
+        self.field_row_picklist_global_combo.grid(row=0, column=3, sticky="ew", padx=(0, 6))
+        self.field_row_picklist_global_combo.bind("<KeyRelease>", self._on_row_global_option_set_input)
+        ttk.Button(self.field_row_picklist_frame, text="加载全局下拉", command=self._load_global_option_sets).grid(row=0, column=4, padx=(0, 12))
+        ttk.Label(self.field_row_picklist_frame, text="默认值（可选）").grid(row=0, column=5, sticky="w", padx=(0, 6))
+        ttk.Entry(self.field_row_picklist_frame, textvariable=self.field_row_picklist_default_var, width=12).grid(row=0, column=6, sticky="w")
+        ttk.Label(self.field_row_picklist_frame, text="本地下拉选项（每行：值:标签）").grid(row=1, column=0, columnspan=2, sticky="nw", pady=(6, 0))
+        self.field_row_picklist_options_text = tk.Text(self.field_row_picklist_frame, height=3, wrap="word")
+        self.field_row_picklist_options_text.grid(row=1, column=2, columnspan=5, sticky="ew", pady=(6, 0))
+        self._on_row_field_type_change(None)
+
+        table_frame = ttk.Frame(top)
+        table_frame.grid(row=10, column=0, columnspan=2, sticky="nsew", padx=6, pady=(10, 0))
+        table_frame.columnconfigure(0, weight=1)
+        columns = ("logical_name", "schema_name", "display_name", "description", "field_type", "required_level", "max_length", "extra")
+        self.field_row_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=10, selectmode="browse")
+        headings = ("字段逻辑名", "字段架构名", "显示名称", "描述", "字段类型", "必填", "最大长度", "附加配置")
+        widths = (145, 155, 120, 170, 90, 80, 90, 220)
+        for column, heading, width in zip(columns, headings, widths):
+            self.field_row_tree.heading(column, text=heading)
+            self.field_row_tree.column(column, width=width, minwidth=70)
+        self.field_row_tree.grid(row=0, column=0, sticky="ew")
+        field_row_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.field_row_tree.yview)
+        field_row_scroll.grid(row=0, column=1, sticky="ns")
+        self.field_row_tree.configure(yscrollcommand=field_row_scroll.set)
+        row_buttons = ttk.Frame(top)
+        row_buttons.grid(row=11, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 0))
+        ttk.Button(row_buttons, text="删除选中行", command=self._remove_selected_field_row).pack(side="left", padx=(0, 8))
+        ttk.Button(row_buttons, text="清空全部行", command=self._clear_field_rows).pack(side="left")
         button_bar = ttk.Frame(top)
-        button_bar.grid(row=23, column=0, columnspan=2, sticky="w", pady=10)
+        button_bar.grid(row=12, column=0, columnspan=2, sticky="w", pady=10)
         ttk.Button(button_bar, text="创建字段", command=self._on_create).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(button_bar, text="导出CS模板", command=self._export_cs_template).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(button_bar, text="从CS导入字段", command=self._import_fields_from_cs).grid(row=0, column=2)
@@ -3578,20 +3598,9 @@ class FieldCreatorGUI:
         self.vars["solution_unique_name"].set(cfg.get("solution_unique_name", ""))
         self.vars["publisher_prefix"].set(cfg.get("publisher_prefix", "mcs"))
         self.vars["solution_search"].set(cfg.get("solution_unique_name", ""))
-        self.vars["field_type"].set(FIELD_TYPE_VALUE_TO_LABEL.get("string", "单行文本"))
-        self.vars["required_level"].set("可选")
-        self.vars["max_length"].set("100")
-        self.vars["lookup_target_entity"].set("")
-        self.vars["lookup_relationship_schema_name"].set("")
-        self.vars["picklist_mode"].set("local")
-        self.vars["picklist_global_name"].set("")
-        self.vars["picklist_default_value"].set("")
-        self.vars["file_max_size_kb"].set("32768")
-        if hasattr(self, "picklist_options_text"):
-            self.picklist_options_text.delete("1.0", "end")
-            self.picklist_options_text.insert("1.0", "100000000:选项1\n100000001:选项2")
-        self._on_picklist_mode_change(None)
-        self._on_field_type_change(None)
+        self._clear_created_field_inputs()
+        self.field_rows.clear()
+        self._refresh_field_row_tree()
         if hasattr(self, "entity_combo"):
             self.entity_combo["values"] = []
         if hasattr(self, "solution_combo"):
@@ -3744,7 +3753,8 @@ class FieldCreatorGUI:
             creator = self._create_creator()
             self.entity_items = creator.list_entities_by_solution(solution_id)
             self._filter_entity_values("")
-            self.lookup_target_combo["values"] = [x["logical_name"] for x in self.entity_items]
+            if hasattr(self, "field_row_lookup_target_combo"):
+                self.field_row_lookup_target_combo["values"] = [x["logical_name"] for x in self.entity_items]
             self.entity_combo.event_generate("<Down>")
             self._append_log(f"已加载解决方案实体数量: {len(self.entity_items)}")
             self._log_op(
@@ -3803,7 +3813,7 @@ class FieldCreatorGUI:
         try:
             creator = self._create_creator()
             self.global_option_set_names = creator.list_global_option_sets()
-            self.picklist_global_combo["values"] = self.global_option_set_names
+            self.field_row_picklist_global_combo["values"] = self.global_option_set_names
             self._append_log(f"已加载全局选项集数量: {len(self.global_option_set_names)}")
             self._log_op(
                 "field",
@@ -3816,7 +3826,7 @@ class FieldCreatorGUI:
                 },
             )
             if self.global_option_set_names:
-                self.picklist_global_combo.event_generate("<Down>")
+                self.field_row_picklist_global_combo.event_generate("<Down>")
             else:
                 messagebox.showinfo("提示", "未找到全局选项集。")
         except Exception as e:
@@ -3904,9 +3914,179 @@ class FieldCreatorGUI:
         return None
 
     def _clear_created_field_inputs(self) -> None:
-        self.vars["logical_name"].set("")
-        self.vars["schema_name"].set("")
-        self.vars["display_name"].set("")
+        for value in self.field_row_vars.values():
+            value.set("")
+        self.field_row_type_var.set(list(FIELD_TYPE_LABEL_TO_VALUE.keys())[0])
+        self.field_row_required_var.set(list(REQUIRED_LEVEL_LABEL_TO_VALUE.keys())[0])
+        self.field_row_lookup_target_var.set("")
+        self.field_row_lookup_relationship_var.set("")
+        self.field_row_picklist_mode_var.set("local")
+        self.field_row_picklist_global_var.set("")
+        self.field_row_picklist_default_var.set("")
+        self.field_row_picklist_options_text.delete("1.0", "end")
+        self._on_row_field_type_change(None)
+
+    def _on_row_field_type_change(self, _event: Any) -> None:
+        field_type = FIELD_TYPE_LABEL_TO_VALUE.get(
+            self.field_row_type_var.get().strip(), self.field_row_type_var.get().strip().lower()
+        )
+        if field_type == "lookup":
+            self.field_row_picklist_frame.grid_remove()
+            self.field_row_lookup_frame.grid()
+            self.field_row_advanced_frame.grid()
+        elif field_type == "picklist":
+            self.field_row_lookup_frame.grid_remove()
+            self.field_row_picklist_frame.grid()
+            self.field_row_advanced_frame.grid()
+            self._on_row_picklist_mode_change(None)
+        else:
+            self.field_row_lookup_frame.grid_remove()
+            self.field_row_picklist_frame.grid_remove()
+            self.field_row_advanced_frame.grid_remove()
+
+    def _on_row_picklist_mode_change(self, _event: Any) -> None:
+        is_global = self.field_row_picklist_mode_var.get().strip().lower() == "global"
+        self.field_row_picklist_options_text.configure(state="disabled" if is_global else "normal")
+        self.field_row_picklist_global_combo.configure(state="normal")
+
+    def _on_row_global_option_set_input(self, _event: Any) -> None:
+        keyword = self.field_row_picklist_global_var.get().strip().lower()
+        if self.global_option_set_names:
+            self.field_row_picklist_global_combo["values"] = [
+                name for name in self.global_option_set_names if keyword in name.lower()
+            ]
+
+    def _add_field_row(self) -> None:
+        row = {
+            "logical_name": self.field_row_vars["logical_name"].get().strip(),
+            "schema_name": self.field_row_vars["schema_name"].get().strip(),
+            "display_name": self.field_row_vars["display_name"].get().strip(),
+            "description": self.field_row_vars["description"].get().strip(),
+            "field_type": FIELD_TYPE_LABEL_TO_VALUE.get(
+                self.field_row_type_var.get().strip(), self.field_row_type_var.get().strip().lower()
+            ),
+            "required_level": REQUIRED_LEVEL_LABEL_TO_VALUE.get(self.field_row_required_var.get().strip(), "None"),
+            "max_length": self.field_row_vars["max_length"].get().strip(),
+            "lookup_target_entity": self.field_row_lookup_target_var.get().strip(),
+            "lookup_relationship_schema_name": self.field_row_lookup_relationship_var.get().strip(),
+            "picklist_mode": self.field_row_picklist_mode_var.get().strip().lower() or "local",
+            "picklist_global_name": self.field_row_picklist_global_var.get().strip(),
+            "picklist_default_value": self.field_row_picklist_default_var.get().strip(),
+            "picklist_options": self.field_row_picklist_options_text.get("1.0", "end").strip(),
+        }
+        if not row["logical_name"] or not row["schema_name"] or not row["display_name"]:
+            messagebox.showerror("错误", "请填写字段逻辑名、字段架构名和显示名称后再新增行。")
+            return
+        try:
+            if row["field_type"] in {"string", "memo"}:
+                int(row["max_length"] or ("100" if row["field_type"] == "string" else "2000"))
+            if row["field_type"] == "lookup" and not row["lookup_target_entity"]:
+                raise ValueError("查找类型必须填写查找目标实体。")
+            if row["field_type"] == "picklist":
+                if row["picklist_mode"] == "global" and not row["picklist_global_name"]:
+                    raise ValueError("全局下拉模式必须填写全局选项集。")
+                if row["picklist_mode"] != "global" and not self._parse_picklist_options(row["picklist_options"]):
+                    raise ValueError("本地下拉模式至少需要一个选项。")
+        except ValueError as exc:
+            messagebox.showerror("错误", str(exc) or "字段附加配置不完整或格式不正确。")
+            return
+        self.field_rows.append(row)
+        self._refresh_field_row_tree()
+        self._clear_created_field_inputs()
+
+    def _refresh_field_row_tree(self) -> None:
+        for iid in self.field_row_tree.get_children():
+            self.field_row_tree.delete(iid)
+        for index, row in enumerate(self.field_rows):
+            field_type = str(row["field_type"])
+            extra = ""
+            if field_type == "lookup":
+                extra = f"目标实体: {row['lookup_target_entity']}"
+            elif field_type == "picklist":
+                extra = (
+                    f"全局选项集: {row['picklist_global_name']}"
+                    if row["picklist_mode"] == "global"
+                    else f"本地选项: {len(self._parse_picklist_options(row['picklist_options']))} 个"
+                )
+            self.field_row_tree.insert(
+                "", "end", iid=str(index), values=(
+                    row["logical_name"], row["schema_name"], row["display_name"], row["description"],
+                    FIELD_TYPE_VALUE_TO_LABEL.get(field_type, field_type), row["required_level"], row["max_length"], extra,
+                )
+            )
+
+    def _remove_selected_field_row(self) -> None:
+        selected = self.field_row_tree.selection()
+        if not selected:
+            messagebox.showinfo("提示", "请先选择要删除的字段行。")
+            return
+        del self.field_rows[int(selected[0])]
+        self._refresh_field_row_tree()
+
+    def _clear_field_rows(self) -> None:
+        if not self.field_rows:
+            return
+        if messagebox.askyesno("清空字段", "确认清空已添加的全部字段行吗？"):
+            self.field_rows.clear()
+            self._refresh_field_row_tree()
+
+    def _build_field_from_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        field_type = str(row["field_type"])
+        field: Dict[str, Any] = {
+            "logical_name": row["logical_name"], "schema_name": row["schema_name"],
+            "display_name": row["display_name"], "description": row["description"],
+            "field_type": field_type, "required_level": row["required_level"],
+            "is_audit_enabled": False, "searchable": True,
+        }
+        if field_type == "string":
+            field["string"] = {"max_length": int(row["max_length"] or "100")}
+        elif field_type == "memo":
+            field["memo"] = {"max_length": int(row["max_length"] or "2000")}
+        elif field_type == "file":
+            field["file"] = {"max_size_kb": 32768}
+        elif field_type == "lookup":
+            field["lookup"] = {
+                "target_entity": row["lookup_target_entity"],
+                "relationship_schema_name": row["lookup_relationship_schema_name"],
+            }
+        elif field_type == "picklist":
+            picklist: Dict[str, Any] = {}
+            if row["picklist_default_value"]:
+                picklist["default_value"] = int(row["picklist_default_value"])
+            if row["picklist_mode"] == "global":
+                picklist["global_option_set_name"] = row["picklist_global_name"]
+            else:
+                picklist["options"] = self._parse_picklist_options(row["picklist_options"])
+            field["picklist"] = picklist
+        return field
+
+    def _confirm_create_preview(self, preview_lines: List[str]) -> bool:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("创建字段预览")
+        dialog.geometry("760x520")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ttk.Label(dialog, text="以下字段将被创建，请确认无误后继续。", font=("", 10, "bold")).pack(
+            anchor="w", padx=10, pady=(10, 6)
+        )
+        frame = ttk.Frame(dialog)
+        frame.pack(fill="both", expand=True, padx=10, pady=4)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        text_box = tk.Text(frame, wrap="none")
+        text_box.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text_box.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        text_box.configure(yscrollcommand=scrollbar.set)
+        text_box.insert("1.0", "\n".join(preview_lines))
+        text_box.configure(state="disabled")
+        result = {"confirmed": False}
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=10, pady=(6, 10))
+        ttk.Button(buttons, text="确认创建", command=lambda: (result.update(confirmed=True), dialog.destroy())).pack(side="left")
+        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="left", padx=(8, 0))
+        dialog.wait_window()
+        return result["confirmed"]
 
     def _confirm_import_preview(self, preview_lines: List[str]) -> bool:
         dialog = tk.Toplevel(self.root)
@@ -4241,6 +4421,67 @@ namespace D365ModelTemplate
 
     def _on_create(self) -> None:
         try:
+            if not self.field_rows:
+                raise ValueError("请至少新增一行字段后再创建。")
+            entity_value = self.vars["entity_logical_name"].get().strip()
+            if "(" in entity_value:
+                entity_value = entity_value.split("(", 1)[0].strip()
+            schema = {
+                "entity_logical_name": entity_value,
+                "solution_unique_name": self.vars["solution_unique_name"].get().strip(),
+                "publisher_prefix": self.vars["publisher_prefix"].get().strip(),
+                "fields": [self._build_field_from_row(row) for row in self.field_rows],
+            }
+            creator = self._create_creator()
+            creator._validate_schema(schema)
+            preview_lines = [
+                f"目标解决方案: {schema['solution_unique_name']}",
+                f"目标实体: {entity_value}",
+                f"发布者前缀: {schema['publisher_prefix']}", "", "即将创建字段:",
+            ]
+            for index, field in enumerate(schema["fields"], start=1):
+                preview_lines.append(
+                    f"{index:>3}. {field['logical_name']} | 架构名={field['schema_name']} | "
+                    f"显示名={field['display_name']} | 类型={FIELD_TYPE_VALUE_TO_LABEL.get(field['field_type'], field['field_type'])} | "
+                    f"必填={field['required_level']}"
+                )
+                if field["field_type"] == "lookup":
+                    preview_lines.append(f"     查找目标实体: {field['lookup']['target_entity']}")
+                elif field["field_type"] == "picklist":
+                    picklist = field["picklist"]
+                    if picklist.get("global_option_set_name"):
+                        preview_lines.append(f"     全局选项集: {picklist['global_option_set_name']}")
+                    else:
+                        preview_lines.append(f"     本地选项: {len(picklist.get('options', []))} 个")
+            preview_lines.extend(["", f"合计: {len(schema['fields'])} 个字段"])
+            if not self._confirm_create_preview(preview_lines):
+                self._append_log("用户取消了批量创建字段。")
+                return
+            created, skipped = 0, 0
+            results: List[str] = []
+            for field in schema["fields"]:
+                result = creator.create_field(entity_name=entity_value, solution=schema["solution_unique_name"], field=field)
+                results.append(result)
+                if result.startswith("Skip existing field:"):
+                    skipped += 1
+                else:
+                    created += 1
+                self._append_log(f"{result}，字段类型: {FIELD_TYPE_VALUE_TO_LABEL.get(field['field_type'], field['field_type'])}")
+            detail_result = f"批量创建完成：创建 {created} 个，跳过已存在 {skipped} 个，共 {len(schema['fields'])} 个。"
+            self.field_rows.clear()
+            self._refresh_field_row_tree()
+            self._log_op(
+                "field", "create_field", "success", detail_result,
+                details={
+                    "entity": entity_value, "solution": schema["solution_unique_name"],
+                    "fields": sanitize_details(schema["fields"]), "api_results": results,
+                    "created": created, "skipped": skipped,
+                },
+                entity_name=entity_value, solution_name=schema["solution_unique_name"],
+            )
+            messagebox.showinfo("创建成功", detail_result)
+            return
+
             creator = self._create_creator()
             field_type = self._get_field_type_value()
             field_type_label = FIELD_TYPE_VALUE_TO_LABEL.get(field_type, field_type)
@@ -6377,6 +6618,10 @@ namespace D365ModelTemplate
             "McsAutomate",
             "app_allcomponents",
         ]
+        # These shared solutions are installed as managed solutions in UAT.
+        # Always export them as managed packages during deployment, even when
+        # the global managed-export option is not selected.
+        managed_preset_solution_names = set(preset_solution_names)
         self.deploy_preset_solution_vars: Dict[str, tk.BooleanVar] = {}
 
         def remove_solution_name(name: str) -> None:
@@ -6546,6 +6791,9 @@ namespace D365ModelTemplate
 
             deploy_options = {
                 "managed": managed_var.get(),
+                "managed_preset_solutions": sorted(
+                    set(self.deploy_solution_names) & managed_preset_solution_names
+                ),
                 "overwrite_unmanaged": overwrite_var.get(),
                 "publish_after_import": publish_var.get(),
                 "save_local_zip": save_local_var.get(),
@@ -6597,6 +6845,10 @@ namespace D365ModelTemplate
                     completed: List[str] = []
                     for index, solution_name in enumerate(self.deploy_solution_names):
                         step_label = f"[{index + 1}/{total}] {solution_name}"
+                        export_as_managed = (
+                            managed_var.get()
+                            or solution_name in managed_preset_solution_names
+                        )
 
                         self.root.after(
                             0,
@@ -6607,7 +6859,7 @@ namespace D365ModelTemplate
                         )
                         solution_bytes = source_creator.export_solution(
                             solution_unique_name=solution_name,
-                            managed=managed_var.get(),
+                            managed=export_as_managed,
                         )
 
                         if save_dir:

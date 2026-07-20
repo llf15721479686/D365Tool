@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import threading
@@ -10,6 +11,7 @@ import tkinter as tk
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional, Set
@@ -38,6 +40,7 @@ class TranslationPanel:
         self._import_tree: Optional[ET.ElementTree] = None
         self._import_source_path: Optional[Path] = None
         self._import_result: Optional[Dict[str, int]] = None
+        self._solution_translation_context: Optional[Dict[str, Any]] = None
         self._openai_missing_warned = False
         self._loading = False
         self._build()
@@ -159,6 +162,23 @@ class TranslationPanel:
         ttk.Button(btn_bar, text="导出文件", command=self._export_import_file, width=10).pack(
             side="left", padx=(0, 6)
         )
+        ttk.Button(btn_bar, text="搜索解决方案", command=self._search_solution_options, width=12).pack(
+            side="left", padx=(0, 4)
+        )
+        self.solution_name_var = tk.StringVar(value="")
+        self.solution_combo = ttk.Combobox(btn_bar, textvariable=self.solution_name_var, width=26)
+        self.solution_combo.pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(btn_bar, text="翻译解决方案", command=self._preview_solution_translation, width=14).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(
+            btn_bar,
+            text="翻译导出解决方案",
+            command=lambda: self._preview_solution_translation(export_only=True),
+            width=16,
+        ).pack(side="left", padx=(0, 6))
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_text_var = tk.StringVar(value="0%")
         progress_wrap = ttk.Frame(btn_bar)
@@ -665,6 +685,332 @@ class TranslationPanel:
     def _normalize_cell_value(value: str) -> str:
         """让每个翻译结果粘贴到 Excel 时始终只占一个单元格。"""
         return " ".join(str(value).replace("\t", " ").splitlines()).strip()
+
+    def _search_solution_options(self) -> None:
+        """Search in place and put matching solutions in the page combobox."""
+        keyword = self.solution_name_var.get().strip()
+        try:
+            rows = self.gui._create_creator().list_solutions(keyword=keyword, top=100)
+        except Exception as exc:
+            messagebox.showerror("搜索失败", str(exc), parent=self.gui.root)
+            return
+        names = [str(row.get("unique_name", "")).strip() for row in rows]
+        names = [name for name in names if name]
+        self.solution_combo["values"] = names
+        if names:
+            self.solution_name_var.set(names[0])
+            self.solution_combo.focus_set()
+            self.solution_combo.event_generate("<Down>")
+            self.status_var.set(f"找到 {len(names)} 个匹配的解决方案，请在下拉框中选择。")
+        else:
+            self.status_var.set("未找到匹配的解决方案。")
+            messagebox.showinfo("提示", "未找到匹配的解决方案。", parent=self.gui.root)
+
+    def _choose_solution(self) -> None:
+        """Open a small searchable solution picker for solution translations."""
+        dialog = tk.Toplevel(self.gui.root)
+        dialog.title("选择解决方案")
+        dialog.transient(self.gui.root)
+        dialog.geometry("620x180")
+        dialog.columnconfigure(1, weight=1)
+
+        keyword_var = tk.StringVar()
+        result_var = tk.StringVar()
+        items: List[Dict[str, str]] = []
+        ttk.Label(dialog, text="名称关键字:").grid(row=0, column=0, padx=10, pady=12, sticky="w")
+        keyword_entry = ttk.Entry(dialog, textvariable=keyword_var)
+        keyword_entry.grid(row=0, column=1, padx=(0, 6), pady=12, sticky="ew")
+        combo = ttk.Combobox(dialog, textvariable=result_var, state="readonly")
+        combo.grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 12), sticky="ew")
+
+        def search() -> None:
+            try:
+                rows = self.gui._create_creator().list_solutions(keyword=keyword_var.get().strip(), top=100)
+            except Exception as exc:
+                messagebox.showerror("搜索失败", str(exc), parent=dialog)
+                return
+            items[:] = rows
+            combo["values"] = [
+                f"{row.get('unique_name', '')} | {row.get('friendly_name', '')}".strip(" |")
+                for row in rows
+            ]
+            if rows:
+                combo.current(0)
+            else:
+                result_var.set("")
+
+        def select() -> None:
+            index = combo.current()
+            if index < 0 or index >= len(items):
+                messagebox.showinfo("提示", "请先搜索并选择一个解决方案。", parent=dialog)
+                return
+            self.solution_name_var.set(str(items[index].get("unique_name", "")).strip())
+            dialog.destroy()
+
+        ttk.Button(dialog, text="搜索", command=search).grid(row=0, column=2, padx=(0, 10), pady=12)
+        ttk.Button(dialog, text="确定", command=select).grid(row=2, column=1, pady=(0, 10), sticky="e")
+        ttk.Button(dialog, text="取消", command=dialog.destroy).grid(row=2, column=2, padx=10, pady=(0, 10))
+        keyword_entry.bind("<Return>", lambda _event: search())
+        keyword_entry.focus_set()
+
+    def _preview_solution_translation(self, export_only: bool = False) -> None:
+        if self._loading:
+            return
+        solution_name = self.solution_name_var.get().strip()
+        active_langs = self._active_languages_sorted()
+        if not solution_name:
+            messagebox.showwarning("提示", "请先选择解决方案。", parent=self.gui.root)
+            return
+        if not active_langs:
+            messagebox.showwarning("提示", "请先在左侧选择需要翻译的语言列。", parent=self.gui.root)
+            return
+        self._loading = True
+        self.status_var.set(f"正在导出 {solution_name} 的翻译文件...")
+        self._update_progress(0, 1)
+
+        def worker() -> None:
+            try:
+                archive = self.gui._create_creator().export_solution_translations(solution_name)
+                context = self._prepare_solution_translation_context(archive, solution_name, active_langs)
+                context["export_only"] = export_only
+            except Exception as exc:
+                self.gui.root.after(0, lambda e=exc: self._on_translate_failed(e))
+                return
+            self.gui.root.after(0, lambda: self._show_solution_translation_preview(context))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _prepare_solution_translation_context(
+        self, archive: bytes, solution_name: str, active_langs: List[str]
+    ) -> Dict[str, Any]:
+        with zipfile.ZipFile(io.BytesIO(archive), "r") as source_zip:
+            xml_name = next(
+                (info.filename for info in source_zip.infolist() if info.filename.rsplit("/", 1)[-1].lower() == "crmtranslations.xml"),
+                "",
+            )
+            if not xml_name:
+                raise RuntimeError("导出的翻译包中未找到 CrmTranslations.xml。")
+            xml_bytes = source_zip.read(xml_name)
+        ns = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
+        ET.register_namespace("", "urn:schemas-microsoft-com:office:spreadsheet")
+        ET.register_namespace("o", "urn:schemas-microsoft-com:office:office")
+        ET.register_namespace("x", "urn:schemas-microsoft-com:office:excel")
+        ET.register_namespace("ss", "urn:schemas-microsoft-com:office:spreadsheet")
+        tree = ET.ElementTree(ET.fromstring(xml_bytes))
+        selected_lcids = {
+            LANGUAGE_LCID.get(normalize_language_name(lang), ""): lang for lang in active_langs
+        }
+        selected_lcids.pop("", None)
+        tasks = self._collect_solution_translation_tasks(tree.getroot(), ns, selected_lcids)
+        if not tasks:
+            raise RuntimeError("没有发现需要翻译的内容。请确认已选择的语言列存在，且其中有空白或中英文错列的数据。")
+        return {
+            "archive": archive,
+            "xml_name": xml_name,
+            "tree": tree,
+            "tasks": tasks,
+            "solution_name": solution_name,
+            "xml_has_excel_marker": b"<?mso-application progid=\"Excel.Sheet\"?>" in xml_bytes[:500],
+        }
+
+    def _show_solution_translation_preview(self, context: Dict[str, Any]) -> None:
+        self._loading = False
+        tasks = context["tasks"]
+        preview_action = "导出翻译文件" if context.get("export_only") else "导入翻译并发布"
+        self._update_progress(0, len(tasks))
+        self.status_var.set(f"已生成预览：{len(tasks)} 项待翻译。")
+        dialog = tk.Toplevel(self.gui.root)
+        dialog.title("翻译内容预览")
+        dialog.transient(self.gui.root)
+        dialog.geometry("980x560")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+        ttk.Label(dialog, text=f"解决方案：{context['solution_name']}；待翻译 {len(tasks)} 项。确认后将{preview_action}。", padding=10).grid(row=0, column=0, sticky="w")
+        frame = ttk.Frame(dialog, padding=(10, 0, 10, 6))
+        frame.grid(row=1, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        tree = ttk.Treeview(frame, columns=("language", "source", "current"), show="headings")
+        tree.heading("language", text="翻译列")
+        tree.heading("source", text="待翻译原文")
+        tree.heading("current", text="当前内容")
+        tree.column("language", width=130, stretch=False)
+        tree.column("source", width=410, stretch=True)
+        tree.column("current", width=410, stretch=True)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=scrollbar.set)
+        for task in tasks:
+            tree.insert("", "end", values=(get_lang_label(task["lang"]), task["source"], task["current"]))
+
+        button_frame = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        button_frame.grid(row=2, column=0, sticky="e")
+        ttk.Button(button_frame, text="取消", command=dialog.destroy).pack(side="right")
+
+        def confirm() -> None:
+            if context.get("export_only"):
+                output_path = filedialog.asksaveasfilename(
+                    parent=dialog,
+                    title="保存翻译后的解决方案文件",
+                    initialfile=f"{context['solution_name']}_translations.zip",
+                    defaultextension=".zip",
+                    filetypes=[("ZIP 文件", "*.zip")],
+                )
+                if not output_path:
+                    return
+                context["output_path"] = output_path
+            dialog.destroy()
+            self._run_solution_translation(context)
+
+        ttk.Button(button_frame, text=f"确认翻译并{preview_action}", command=confirm).pack(side="right", padx=(0, 8))
+        dialog.grab_set()
+
+    def _run_solution_translation(self, context: Dict[str, Any]) -> None:
+        self._loading = True
+        self.translator = None
+        tasks = context["tasks"]
+        total = len(tasks)
+        self._update_progress(0, total)
+        self.status_var.set("正在翻译解决方案...")
+
+        def worker() -> None:
+            cache_hits = api_calls = failed = 0
+            try:
+                for done, task in enumerate(tasks, 1):
+                    translated, from_cache, translation_failed = self._translate_text_cached(task["source"], task["lang"])
+                    if from_cache:
+                        cache_hits += 1
+                    elif translation_failed:
+                        failed += 1
+                    else:
+                        api_calls += 1
+                    if translated:
+                        data_elem = task["data"]
+                        data_elem.text = self._normalize_cell_value(translated)
+                        data_elem.set("{urn:schemas-microsoft-com:office:spreadsheet}Type", "String")
+                    self.gui.root.after(0, lambda d=done, t=total: self._update_progress(d, t))
+
+                translation_zip = self._build_solution_translation_zip(context)
+                if context.get("export_only"):
+                    with open(context["output_path"], "wb") as output_file:
+                        output_file.write(translation_zip)
+                else:
+                    self.gui.root.after(0, lambda: self.status_var.set("正在导入翻译并发布解决方案..."))
+                    creator = self.gui._create_creator()
+                    creator.import_solution_translations(translation_zip)
+                    creator.publish_all_customizations()
+            except Exception as exc:
+                self.gui.root.after(0, lambda e=exc: self._on_translate_failed(e))
+                return
+
+            def on_done() -> None:
+                self._loading = False
+                self._update_progress(total, total)
+                action = "翻译文件已导出" if context.get("export_only") else "翻译并发布完成"
+                self.status_var.set(f"解决方案{action}：更新 {total - failed}，失败 {failed}。")
+                self.gui._append_log(
+                    f"[解决方案翻译] {context['solution_name']} {action}：更新 {total - failed}，缓存命中 {cache_hits}，新翻译 {api_calls}，失败 {failed}"
+                )
+                if hasattr(self.gui, "_refresh_translation_records_panel"):
+                    self.gui._refresh_translation_records_panel()
+                if context.get("export_only"):
+                    messagebox.showinfo("完成", f"已导出翻译文件：\n{context['output_path']}", parent=self.gui.root)
+                else:
+                    messagebox.showinfo("完成", f"解决方案 {context['solution_name']} 已翻译并发布。", parent=self.gui.root)
+
+            self.gui.root.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _build_solution_translation_zip(self, context: Dict[str, Any]) -> bytes:
+        xml_data = ET.tostring(context["tree"].getroot(), encoding="utf-8", xml_declaration=True)
+        marker = b'<?mso-application progid="Excel.Sheet"?>'
+        if context["xml_has_excel_marker"] and marker not in xml_data:
+            declaration_end = xml_data.find(b"?>") + 2
+            xml_data = xml_data[:declaration_end] + b"\n" + marker + xml_data[declaration_end:]
+        output = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(context["archive"]), "r") as source_zip, zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target_zip:
+            for info in source_zip.infolist():
+                data = xml_data if info.filename == context["xml_name"] else source_zip.read(info.filename)
+                target_zip.writestr(info, data)
+        return output.getvalue()
+
+    def _collect_solution_translation_tasks(
+        self, root: ET.Element, ns: Dict[str, str], target_lcids: Dict[str, str]
+    ) -> List[Dict[str, Any]]:
+        tasks: List[Dict[str, Any]] = []
+        ss_index = "{urn:schemas-microsoft-com:office:spreadsheet}Index"
+        for worksheet in root.findall("ss:Worksheet", ns):
+            table = worksheet.find("ss:Table", ns)
+            if table is None:
+                continue
+            rows = table.findall("ss:Row", ns)
+            if len(rows) < 2:
+                continue
+            headers = self._cells_by_column(rows[0], ss_index)
+            lcid_columns = {self._cell_text(cell, ns).strip(): col for col, cell in headers.items()}
+            chinese_col = lcid_columns.get("2052")
+            english_col = lcid_columns.get("1033")
+            for row in rows[1:]:
+                cells = self._cells_by_column(row, ss_index)
+                chinese = self._cell_text(cells.get(chinese_col), ns).strip() if chinese_col else ""
+                english = self._cell_text(cells.get(english_col), ns).strip() if english_col else ""
+                for lcid, lang in target_lcids.items():
+                    column = lcid_columns.get(lcid)
+                    if not column:
+                        continue
+                    cell = cells.get(column)
+                    current = self._cell_text(cell, ns).strip()
+                    source = ""
+                    if lcid == "1033":
+                        if chinese and (not current or self._contains_chinese(current)):
+                            source = chinese
+                    elif lcid == "2052":
+                        if english and (not current or self._contains_english(current)):
+                            source = english
+                    elif not current and chinese:
+                        source = chinese
+                    if not source:
+                        continue
+                    if cell is None:
+                        cell = self._add_spreadsheet_cell(row, column)
+                    data_elem = cell.find("ss:Data", ns)
+                    if data_elem is None:
+                        data_elem = ET.SubElement(cell, "{urn:schemas-microsoft-com:office:spreadsheet}Data")
+                        data_elem.set("{urn:schemas-microsoft-com:office:spreadsheet}Type", "String")
+                    tasks.append({"source": source, "lang": lang, "current": current, "data": data_elem})
+        return tasks
+
+    @staticmethod
+    def _contains_chinese(text: str) -> bool:
+        return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+    @staticmethod
+    def _contains_english(text: str) -> bool:
+        return any(("a" <= char.lower() <= "z") for char in text)
+
+    @staticmethod
+    def _add_spreadsheet_cell(row: ET.Element, column: int) -> ET.Element:
+        ns = "{urn:schemas-microsoft-com:office:spreadsheet}"
+        cell = ET.Element(f"{ns}Cell")
+        cell.set(f"{ns}Index", str(column))
+        current_column = 1
+        for position, sibling in enumerate(list(row)):
+            if not str(sibling.tag).endswith("Cell"):
+                continue
+            raw_index = sibling.get(f"{ns}Index")
+            if raw_index:
+                try:
+                    current_column = int(raw_index)
+                except ValueError:
+                    pass
+            if current_column > column:
+                row.insert(position, cell)
+                return cell
+            current_column += 1
+        row.append(cell)
+        return cell
 
     def _translate_import_file(self) -> None:
         if self._loading:
